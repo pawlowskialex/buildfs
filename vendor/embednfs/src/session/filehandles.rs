@@ -24,6 +24,28 @@ impl StateManager {
         self.stable_filehandles = stable;
     }
 
+    /// Cheap syntactic filehandle check used by PUTFH.
+    pub(crate) fn fh_has_valid_format(&self, fh: &embednfs_proto::NfsFh4) -> bool {
+        let len = fh.0.len();
+        if self.stable_filehandles {
+            (9..=NFS4_FHSIZE).contains(&len)
+                && matches!(
+                    fh.0.first(),
+                    Some(&(FH_TAG_FS | FH_TAG_NAMED_ATTR_DIR | FH_TAG_NAMED_ATTR_FILE | FH_TAG_TABLE))
+                )
+        } else {
+            len == std::mem::size_of::<u64>()
+        }
+    }
+
+    /// Uses a persistent server identity (owner major id and scope) so that
+    /// clients recognize a restarted server as the same server and run
+    /// normal reboot recovery instead of treating it as a new server.
+    pub(crate) fn set_server_identity(&mut self, identity: bytes::Bytes) {
+        self.server_owner.major_id = identity.clone();
+        self.server_scope = identity;
+    }
+
     pub(crate) fn object_to_fh(&self, object: &ServerObject) -> embednfs_proto::NfsFh4 {
         if self.stable_filehandles
             && let Some(fh) = encode_stable_fh(object)

@@ -97,6 +97,7 @@ pub(crate) struct StateManager {
     /// Server boot verifier (changes each restart).
     pub(crate) write_verifier: Verifier4,
     pub(crate) server_owner: ServerOwner4,
+    pub(crate) server_scope: Bytes,
 }
 
 impl StateManager {
@@ -164,6 +165,7 @@ impl StateManager {
             config,
             write_verifier,
             server_owner,
+            server_scope: Bytes::from_static(b"embednfs"),
         }
     }
 }

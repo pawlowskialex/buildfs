@@ -91,9 +91,23 @@ pub struct NfsServerBuilder<F: FileSystem> {
     fs: F,
     id_mapper: Arc<dyn IdMapper>,
     max_concurrent_requests: usize,
+    server_identity: Option<Bytes>,
 }
 
 impl<F: FileSystem> NfsServerBuilder<F> {
+    /// Sets a persistent server identity (`server_owner.major_id` and
+    /// `server_scope`, RFC 8881 §2.10.5).
+    ///
+    /// By default every server instance gets a unique identity, which makes
+    /// clients treat a restarted server as a different server. A filesystem
+    /// whose filehandles survive restarts should pass an identity that is
+    /// stable for the exported data (and unique per export) so clients can
+    /// recover transparently.
+    pub fn server_identity(mut self, identity: impl Into<Bytes>) -> Self {
+        self.server_identity = Some(identity.into());
+        self
+    }
+
     /// Replaces the uid/gid string mapper used for `owner` attributes.
     pub fn id_mapper<M: IdMapper>(mut self, mapper: M) -> Self {
         self.id_mapper = Arc::new(mapper);
@@ -116,6 +130,9 @@ impl<F: FileSystem> NfsServerBuilder<F> {
     pub fn build(self) -> NfsServer<F> {
         let mut state = StateManager::new();
         state.set_stable_filehandles(self.fs.stable_handles().is_some());
+        if let Some(identity) = self.server_identity {
+            state.set_server_identity(identity);
+        }
         NfsServer {
             fs: Arc::new(self.fs),
             state: Arc::new(state),
@@ -146,6 +163,7 @@ impl<F: FileSystem> NfsServer<F> {
             fs,
             id_mapper: Arc::new(NumericIdMapper),
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            server_identity: None,
         }
     }
 
@@ -200,8 +218,8 @@ impl<F: FileSystem> NfsServer<F> {
         self.fs.close_support()
     }
 
-    fn fh_has_valid_format(fh: &NfsFh4) -> bool {
-        fh.0.len() == std::mem::size_of::<u64>()
+    fn fh_has_valid_format(&self, fh: &NfsFh4) -> bool {
+        self.state.fh_has_valid_format(fh)
     }
 
     fn parse_auth_sys(body: &Bytes) -> Option<AuthSysParams> {

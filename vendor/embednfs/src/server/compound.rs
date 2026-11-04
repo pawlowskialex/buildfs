@@ -239,7 +239,7 @@ impl<F: FileSystem> NfsServer<F> {
                 self.op_open(request_ctx, args, &mut state.current_fh).await
             }
             NfsArgop4::Putfh(args) => {
-                if !Self::fh_has_valid_format(&args.object) {
+                if !self.fh_has_valid_format(&args.object) {
                     return NfsResop4::Putfh(NfsStat4::Badhandle);
                 }
                 state.current_fh = Some(args.object.clone());
