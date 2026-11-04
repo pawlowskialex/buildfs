@@ -15,7 +15,7 @@ pub use fs::{
     AccessMask, Attrs, AuthContext, CloseSupport, CommitSupport, CreateKind, CreateRequest,
     CreateResult, DirEntry, DirPage, FileSystem, FsCapabilities, FsError, FsLimits, FsResult,
     FsStats, HardLinks, ObjectType, OpenRequest, OpenSupport, ReadResult, RequestContext, SetAttrs,
-    SetTime, Symlinks, Timestamp, WriteResult, WriteStability, XattrSetMode, Xattrs,
+    SetTime, StableHandles, Symlinks, Timestamp, WriteResult, WriteStability, XattrSetMode, Xattrs,
 };
 pub use memfs::MemFs;
 pub use server::{

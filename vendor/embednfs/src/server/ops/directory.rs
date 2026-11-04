@@ -3,7 +3,7 @@ use tracing::{trace, warn};
 use embednfs_proto::*;
 
 use crate::attrs;
-use crate::fs::{FileSystem, FsError, ObjectType, RequestContext};
+use crate::fs::{CreateKind, FileSystem, FsError, ObjectType, RequestContext};
 use crate::internal::{ServerFileType, ServerObject};
 
 use super::super::{
@@ -82,10 +82,30 @@ impl<F: FileSystem> NfsServer<F> {
                     Err(e) => return NfsResop4::Create(e.to_nfsstat4(), None, Bitmap4::new()),
                 }
             }
+            Createtype4::Fifo | Createtype4::Sock | Createtype4::Chr(_) | Createtype4::Blk(_) => {
+                let kind = match &args.objtype {
+                    Createtype4::Chr(spec) => CreateKind::CharDevice {
+                        major: spec.specdata1,
+                        minor: spec.specdata2,
+                    },
+                    Createtype4::Blk(spec) => CreateKind::BlockDevice {
+                        major: spec.specdata1,
+                        minor: spec.specdata2,
+                    },
+                    Createtype4::Sock => CreateKind::Socket,
+                    _ => CreateKind::Fifo,
+                };
+                match self
+                    .create_kind(request_ctx, dir_id, &args.objname, kind, set_attrs.clone())
+                    .await
+                {
+                    Ok(created) => (ServerObject::Fs(created.handle), ServerFileType::Regular),
+                    Err(e) => return NfsResop4::Create(e.to_nfsstat4(), None, Bitmap4::new()),
+                }
+            }
             Createtype4::Unsupported(_) => {
                 return NfsResop4::Create(NfsStat4::Badtype, None, Bitmap4::new());
             }
-            _ => return NfsResop4::Create(NfsStat4::Notsupp, None, Bitmap4::new()),
         };
 
         let new_fh = self.state.object_to_fh(&new_object);

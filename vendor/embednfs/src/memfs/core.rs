@@ -222,6 +222,10 @@ impl FileSystem for MemFs {
         let new_id = self.next_id();
         let mut inner = self.inner.write().await;
 
+        if !matches!(req.kind, CreateKind::File | CreateKind::Directory) {
+            // The in-memory reference filesystem does not model special files.
+            return Err(FsError::Unsupported);
+        }
         {
             let parent_inode = inner.inodes.get(parent).ok_or(FsError::Stale)?;
             if parent_inode.attrs.object_type != ObjectType::Directory {
@@ -237,15 +241,15 @@ impl FileSystem for MemFs {
         let mut inode = Inode {
             attrs: Attrs::new(
                 match req.kind {
-                    CreateKind::File => ObjectType::File,
                     CreateKind::Directory => ObjectType::Directory,
+                    _ => ObjectType::File,
                 },
                 new_id,
             ),
             parent: Some(*parent),
             data: match req.kind {
-                CreateKind::File => InodeData::File(Vec::new()),
                 CreateKind::Directory => InodeData::Directory(HashMap::new()),
+                _ => InodeData::File(Vec::new()),
             },
             xattrs: HashMap::new(),
         };

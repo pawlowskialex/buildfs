@@ -104,6 +104,10 @@ pub(crate) fn encode_fattr4(
             ServerFileType::Regular => NfsFtype4::Reg,
             ServerFileType::Directory => NfsFtype4::Dir,
             ServerFileType::Symlink => NfsFtype4::Lnk,
+            ServerFileType::Fifo => NfsFtype4::Fifo,
+            ServerFileType::Socket => NfsFtype4::Sock,
+            ServerFileType::CharDevice => NfsFtype4::Chr,
+            ServerFileType::BlockDevice => NfsFtype4::Blk,
             ServerFileType::NamedAttrDir => NfsFtype4::AttrDir,
             ServerFileType::NamedAttr => NfsFtype4::NamedAttr,
         };

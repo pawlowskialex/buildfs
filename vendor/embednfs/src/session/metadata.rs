@@ -16,6 +16,10 @@ impl StateManager {
             ServerFileType::Regular | ServerFileType::NamedAttr => 0o644,
             ServerFileType::Directory | ServerFileType::NamedAttrDir => 0o755,
             ServerFileType::Symlink => 0o777,
+            ServerFileType::Fifo
+            | ServerFileType::Socket
+            | ServerFileType::CharDevice
+            | ServerFileType::BlockDevice => 0o644,
         }
     }
 

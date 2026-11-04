@@ -86,6 +86,8 @@ pub(crate) struct StateManager {
     fh_to_object: DashMap<Vec<u8>, ServerObject>,
     object_to_fh: DashMap<ServerObject, Vec<u8>>,
     next_fh: AtomicU64,
+    /// Embed object ids directly in filehandles (see `StableHandles`).
+    stable_filehandles: bool,
     next_clientid: AtomicU64,
     next_stateid: AtomicU32,
     next_changeid: AtomicU64,
@@ -153,6 +155,7 @@ impl StateManager {
             fh_to_object: DashMap::new(),
             object_to_fh: DashMap::new(),
             next_fh: AtomicU64::new(1),
+            stable_filehandles: false,
             next_clientid: AtomicU64::new(1),
             next_stateid: AtomicU32::new(1),
             next_changeid: AtomicU64::new(2),

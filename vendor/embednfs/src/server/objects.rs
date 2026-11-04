@@ -7,6 +7,9 @@ use super::{NfsResult, NfsServer};
 
 impl<F: FileSystem> NfsServer<F> {
     pub(super) async fn register_handle(&self, handle: &F::Handle) -> ObjectId {
+        if let Some(stable) = self.fs.stable_handles() {
+            return stable.id_of(handle);
+        }
         if let Some(id) = self.handle_to_object.read().await.get(handle).copied() {
             return id;
         }
@@ -37,6 +40,9 @@ impl<F: FileSystem> NfsServer<F> {
     }
 
     pub(super) async fn resolve_backend_handle(&self, object_id: ObjectId) -> NfsResult<F::Handle> {
+        if let Some(stable) = self.fs.stable_handles() {
+            return stable.handle_of(object_id).ok_or(FsError::Stale);
+        }
         self.object_to_handle
             .read()
             .await

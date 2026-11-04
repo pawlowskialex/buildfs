@@ -107,6 +107,14 @@ pub enum ObjectType {
     Directory,
     /// Symbolic link object.
     Symlink,
+    /// Named pipe.
+    Fifo,
+    /// Unix domain socket.
+    Socket,
+    /// Character device node.
+    CharDevice,
+    /// Block device node.
+    BlockDevice,
 }
 
 /// High-level server capability flags.
@@ -261,6 +269,10 @@ pub struct Attrs {
     pub system: bool,
     /// Whether the object has named attributes.
     pub has_named_attrs: bool,
+    /// Device major number for character/block devices.
+    pub rdev_major: u32,
+    /// Device minor number for character/block devices.
+    pub rdev_minor: u32,
 }
 
 impl Attrs {
@@ -281,7 +293,13 @@ impl Attrs {
                 ObjectType::Directory => 0o755,
                 ObjectType::File => 0o644,
                 ObjectType::Symlink => 0o777,
+                ObjectType::Fifo
+                | ObjectType::Socket
+                | ObjectType::CharDevice
+                | ObjectType::BlockDevice => 0o644,
             },
+            rdev_major: 0,
+            rdev_minor: 0,
             uid: 0,
             gid: 0,
             atime: now,
@@ -451,6 +469,24 @@ pub enum CreateKind {
     File,
     /// Create a directory.
     Directory,
+    /// Create a named pipe.
+    Fifo,
+    /// Create a unix domain socket node.
+    Socket,
+    /// Create a character device node.
+    CharDevice {
+        /// Device major number.
+        major: u32,
+        /// Device minor number.
+        minor: u32,
+    },
+    /// Create a block device node.
+    BlockDevice {
+        /// Device major number.
+        major: u32,
+        /// Device minor number.
+        minor: u32,
+    },
 }
 
 /// Create request for the core `create` operation.
@@ -620,6 +656,26 @@ pub trait OpenSupport<H>: Send + Sync {
     async fn open(&self, ctx: &RequestContext, handle: &H, request: OpenRequest) -> FsResult<()>;
 }
 
+/// Optional stable object identity.
+///
+/// When a filesystem provides this, the server derives wire filehandles
+/// directly from the returned ids instead of keeping per-process lookup
+/// tables. Filehandles then survive server restarts (matching the
+/// `FH4_PERSISTENT` expiry type the server advertises) and server memory no
+/// longer grows with the number of objects ever looked up.
+pub trait StableHandles<H>: Send + Sync {
+    /// Returns a non-zero id for `handle`. Ids must be unique among live
+    /// objects and should never be reused for a different object, otherwise
+    /// clients holding old filehandles will silently address the new object.
+    fn id_of(&self, handle: &H) -> u64;
+
+    /// Maps an id previously returned by [`StableHandles::id_of`] back to a
+    /// backend handle. Returning `None` makes the server report the
+    /// filehandle as stale. Returning a handle for a deleted object is fine
+    /// as long as later operations on it fail with [`FsError::Stale`].
+    fn handle_of(&self, id: u64) -> Option<H>;
+}
+
 /// Core filesystem trait implemented by embedders.
 #[async_trait]
 pub trait FileSystem: Send + Sync + 'static {
@@ -755,6 +811,11 @@ pub trait FileSystem: Send + Sync + 'static {
 
     /// Returns optional explicit open support.
     fn open_support(&self) -> Option<&dyn OpenSupport<Self::Handle>> {
+        None
+    }
+
+    /// Returns optional stable handle support. See [`StableHandles`].
+    fn stable_handles(&self) -> Option<&dyn StableHandles<Self::Handle>> {
         None
     }
 }

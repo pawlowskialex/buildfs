@@ -17,6 +17,10 @@ pub(crate) enum ServerFileType {
     Regular,
     Directory,
     Symlink,
+    Fifo,
+    Socket,
+    CharDevice,
+    BlockDevice,
     NamedAttrDir,
     NamedAttr,
 }
@@ -55,6 +59,10 @@ impl ServerFileType {
             crate::fs::ObjectType::File => Self::Regular,
             crate::fs::ObjectType::Directory => Self::Directory,
             crate::fs::ObjectType::Symlink => Self::Symlink,
+            crate::fs::ObjectType::Fifo => Self::Fifo,
+            crate::fs::ObjectType::Socket => Self::Socket,
+            crate::fs::ObjectType::CharDevice => Self::CharDevice,
+            crate::fs::ObjectType::BlockDevice => Self::BlockDevice,
         }
     }
 }

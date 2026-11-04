@@ -114,9 +114,11 @@ impl<F: FileSystem> NfsServerBuilder<F> {
 
     /// Builds the server instance.
     pub fn build(self) -> NfsServer<F> {
+        let mut state = StateManager::new();
+        state.set_stable_filehandles(self.fs.stable_handles().is_some());
         NfsServer {
             fs: Arc::new(self.fs),
-            state: Arc::new(StateManager::new()),
+            state: Arc::new(state),
             handle_to_object: Arc::new(RwLock::new(HashMap::new())),
             object_to_handle: Arc::new(RwLock::new(HashMap::new())),
             next_object_id: AtomicU64::new(1),
@@ -353,18 +355,24 @@ impl<F: FileSystem> NfsServer<F> {
         name: &str,
         attrs: SetAttrs,
     ) -> NfsResult<CreateResult<ObjectId>> {
+        self.create_kind(ctx, dir_id, name, CreateKind::Directory, attrs)
+            .await
+    }
+
+    /// Creates a non-regular object (directory or special file) through the
+    /// core `create` hook.
+    async fn create_kind(
+        &self,
+        ctx: &RequestContext,
+        dir_id: ObjectId,
+        name: &str,
+        kind: CreateKind,
+        attrs: SetAttrs,
+    ) -> NfsResult<CreateResult<ObjectId>> {
         let handle = self.resolve_backend_handle(dir_id).await?;
         let created = self
             .fs
-            .create(
-                ctx,
-                &handle,
-                name,
-                CreateRequest {
-                    kind: CreateKind::Directory,
-                    attrs,
-                },
-            )
+            .create(ctx, &handle, name, CreateRequest { kind, attrs })
             .await?;
         Ok(CreateResult {
             handle: self.register_handle(&created.handle).await,
