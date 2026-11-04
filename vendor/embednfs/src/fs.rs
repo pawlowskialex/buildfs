@@ -132,6 +132,11 @@ pub struct FsCapabilities {
     pub case_sensitive: bool,
     /// Whether name case is preserved.
     pub case_preserving: bool,
+    /// Whether readdir cookies stay valid across directory mutations
+    /// (e.g. allocated monotonically and never reused). When set, the
+    /// server uses a constant cookie verifier instead of invalidating
+    /// in-progress listings with `NFS4ERR_NOT_SAME` on every change.
+    pub stable_readdir_cookies: bool,
 }
 
 impl Default for FsCapabilities {
@@ -143,6 +148,7 @@ impl Default for FsCapabilities {
             explicit_sync: false,
             case_sensitive: true,
             case_preserving: true,
+            stable_readdir_cookies: false,
         }
     }
 }

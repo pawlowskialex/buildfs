@@ -28,6 +28,7 @@ impl FileSystem for MemFs {
             explicit_sync: true,
             case_sensitive: true,
             case_preserving: true,
+            stable_readdir_cookies: false,
         }
     }
 

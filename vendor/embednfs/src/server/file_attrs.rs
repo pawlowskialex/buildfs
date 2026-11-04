@@ -274,8 +274,13 @@ impl<F: FileSystem> NfsServer<F> {
         before: u64,
     ) -> ChangeInfo4 {
         match self.build_attr(ctx, object).await {
+            // `before` and `after` come from separate backend reads, and other
+            // requests (concurrent forechannel slots) may mutate the object in
+            // between. Claiming atomicity lets clients patch their directory
+            // caches incrementally and miss entries created concurrently, so
+            // report non-atomic change info and make clients revalidate.
             Ok(attr) => ChangeInfo4 {
-                atomic: true,
+                atomic: false,
                 before,
                 after: attr.change_id,
             },

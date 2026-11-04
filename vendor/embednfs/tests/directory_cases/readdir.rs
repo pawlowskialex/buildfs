@@ -582,3 +582,64 @@ async fn test_readdir_subdirectory() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].1, "inner.txt");
 }
+
+/// With `stable_readdir_cookies`, the verifier is constant and a listing can
+/// resume after the directory changed (busy build directories rely on this).
+/// RFC: RFC 8881 §18.23.3 (verifier semantics are server-defined).
+#[tokio::test]
+async fn test_readdir_stable_cookies_resume_after_mutation() {
+    let fs = StableCookieFs {
+        inner: populated_fs(&["alpha.txt", "beta.txt", "gamma.txt"]).await,
+    };
+    let port = start_server_with_fs(fs).await;
+    let mut stream = connect(port).await;
+    let sessionid = setup_session(&mut stream).await;
+
+    let bits = apple_readdirplus_bits();
+    let seq_op = encode_sequence(&sessionid, 1, 0);
+    let rootfh_op = encode_putrootfh();
+    let readdir_op = encode_readdir_custom(0, [0u8; 8], 2048, 4096, &bits);
+    let mut resp = send_rpc(
+        &mut stream,
+        3,
+        1,
+        &encode_compound("readdir-before-mutate", &[&seq_op, &rootfh_op, &readdir_op]),
+    )
+    .await;
+    parse_rpc_reply(&mut resp);
+    let (status, _, _) = parse_compound_header(&mut resp);
+    assert_eq!(status, NfsStat4::Ok as u32);
+    let _ = parse_op_header(&mut resp);
+    skip_sequence_res(&mut resp);
+    let _ = parse_op_header(&mut resp);
+    let _ = parse_op_header(&mut resp);
+    let (_, cookieverf, entries, _) = parse_readdir_body(&mut resp);
+    assert_eq!(cookieverf, [0u8; 8]);
+    assert!(entries.len() >= 2);
+
+    let seq_op = encode_sequence(&sessionid, 2, 0);
+    let create_op = encode_create_dir("delta");
+    let mut resp = send_rpc(
+        &mut stream,
+        4,
+        1,
+        &encode_compound("mutate-dir", &[&seq_op, &rootfh_op, &create_op]),
+    )
+    .await;
+    parse_rpc_reply(&mut resp);
+    let (status, _, _) = parse_compound_header(&mut resp);
+    assert_eq!(status, NfsStat4::Ok as u32);
+
+    let seq_op = encode_sequence(&sessionid, 3, 0);
+    let readdir_op = encode_readdir_custom(entries[0].0, cookieverf, 2048, 4096, &bits);
+    let mut resp = send_rpc(
+        &mut stream,
+        5,
+        1,
+        &encode_compound("readdir-resume", &[&seq_op, &rootfh_op, &readdir_op]),
+    )
+    .await;
+    parse_rpc_reply(&mut resp);
+    let (status, _, _) = parse_compound_header(&mut resp);
+    assert_eq!(status, NfsStat4::Ok as u32);
+}

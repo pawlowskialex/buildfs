@@ -345,7 +345,18 @@ impl<F: FileSystem> NfsServer<F> {
         {
             return NfsResop4::Readdir(NfsStat4::Inval, None);
         }
-        let cookieverf = dir_attr.change_id.to_be_bytes();
+        // Position-based cookies are only meaningful for an unchanged
+        // directory, so the verifier normally tracks the change attribute.
+        // Backends with stable cookies use a constant verifier: listings stay
+        // resumable while the directory is being modified, which matters for
+        // busy directories such as build output trees.
+        let cookieverf = if self.fs.capabilities().stable_readdir_cookies
+            && matches!(object, ServerObject::Fs(_))
+        {
+            [0u8; 8]
+        } else {
+            dir_attr.change_id.to_be_bytes()
+        };
 
         if args.cookie != 0 && args.cookieverf != cookieverf {
             return NfsResop4::Readdir(NfsStat4::NotSame, None);

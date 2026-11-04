@@ -90,6 +90,7 @@ impl FileSystem for BuildFs {
             explicit_sync: true,
             case_sensitive: true,
             case_preserving: true,
+            stable_readdir_cookies: true,
         }
     }
 
@@ -137,7 +138,12 @@ impl FileSystem for BuildFs {
 
     async fn lookup(&self, _ctx: &RequestContext, parent: &Ino, name: &str) -> FsResult<Ino> {
         let (parent, name) = (*parent, name.to_owned());
-        self.run(move |vfs| vfs.lookup(parent, &name)).await
+        self.run(move |vfs| {
+            let r = vfs.lookup(parent, &name);
+            tracing::debug!(target: "buildfs::ops", "lookup {parent}/{name} -> {r:?}");
+            r
+        })
+        .await
     }
 
     async fn parent(&self, _ctx: &RequestContext, dir: &Ino) -> FsResult<Option<Ino>> {
@@ -228,7 +234,9 @@ impl FileSystem for BuildFs {
                 CreateKind::CharDevice { major, minor } => NewNode::CharDev(major, minor),
                 CreateKind::BlockDevice { major, minor } => NewNode::BlockDev(major, minor),
             };
-            let (ino, inode) = vfs.create(&caller, parent, &name, node, &req.attrs)?;
+            let r = vfs.create(&caller, parent, &name, node, &req.attrs);
+            tracing::debug!(target: "buildfs::ops", "create {parent}/{name} -> {:?}", r.as_ref().map(|x| x.0));
+            let (ino, inode) = r?;
             Ok(CreateResult {
                 handle: ino,
                 attrs: Self::attrs(vfs, ino, &inode),
@@ -239,7 +247,12 @@ impl FileSystem for BuildFs {
 
     async fn remove(&self, _ctx: &RequestContext, parent: &Ino, name: &str) -> FsResult<()> {
         let (parent, name) = (*parent, name.to_owned());
-        self.run(move |vfs| vfs.remove(parent, &name)).await
+        self.run(move |vfs| {
+            let r = vfs.remove(parent, &name);
+            tracing::debug!(target: "buildfs::ops", "remove {parent}/{name}: {r:?}");
+            r
+        })
+        .await
     }
 
     async fn rename(
@@ -256,8 +269,12 @@ impl FileSystem for BuildFs {
             *to_dir,
             to_name.to_owned(),
         );
-        self.run(move |vfs| vfs.rename(fd, &fname, td, &tname))
-            .await
+        self.run(move |vfs| {
+            let r = vfs.rename(fd, &fname, td, &tname);
+            tracing::debug!(target: "buildfs::ops", "rename {fd}/{fname} -> {td}/{tname}: {r:?}");
+            r
+        })
+        .await
     }
 
     async fn setattr(&self, ctx: &RequestContext, h: &Ino, attrs: &SetAttrs) -> FsResult<Attrs> {
@@ -376,7 +393,12 @@ impl HardLinks<Ino> for BuildFs {
         name: &str,
     ) -> FsResult<()> {
         let (src, parent, name) = (*source, *parent, name.to_owned());
-        self.run(move |vfs| vfs.link(src, parent, &name)).await
+        self.run(move |vfs| {
+            let r = vfs.link(src, parent, &name);
+            tracing::debug!(target: "buildfs::ops", "link {src} -> {parent}/{name}: {r:?}");
+            r
+        })
+        .await
     }
 }
 

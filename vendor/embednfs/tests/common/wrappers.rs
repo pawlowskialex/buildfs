@@ -16,6 +16,11 @@ pub struct BlockingRemoveFs {
     pub release: Arc<Notify>,
 }
 
+/// Delegates to [`MemFs`] but advertises stable readdir cookies.
+pub struct StableCookieFs {
+    pub inner: MemFs,
+}
+
 pub struct CountingNamedAttrFs {
     pub inner: MemFs,
     pub list_count: Arc<AtomicUsize>,
@@ -658,5 +663,132 @@ impl FileSystem for ForcedWriteStabilityFs {
         attrs: &SetAttrs,
     ) -> FsResult<Attrs> {
         self.inner.setattr(ctx, handle, attrs).await
+    }
+}
+
+#[async_trait::async_trait]
+impl FileSystem for StableCookieFs {
+    type Handle = u64;
+
+    fn root(&self) -> Self::Handle {
+        self.inner.root()
+    }
+    fn capabilities(&self) -> embednfs::FsCapabilities {
+        embednfs::FsCapabilities {
+            stable_readdir_cookies: true,
+            ..self.inner.capabilities()
+        }
+    }
+    fn limits(&self) -> embednfs::FsLimits {
+        self.inner.limits()
+    }
+    async fn statfs(&self, ctx: &RequestContext) -> FsResult<FsStats> {
+        self.inner.statfs(ctx).await
+    }
+    async fn getattr(&self, ctx: &RequestContext, handle: &Self::Handle) -> FsResult<Attrs> {
+        self.inner.getattr(ctx, handle).await
+    }
+    async fn access(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        requested: AccessMask,
+    ) -> FsResult<AccessMask> {
+        self.inner.access(ctx, handle, requested).await
+    }
+    async fn lookup(
+        &self,
+        ctx: &RequestContext,
+        parent: &Self::Handle,
+        name: &str,
+    ) -> FsResult<Self::Handle> {
+        self.inner.lookup(ctx, parent, name).await
+    }
+    async fn parent(
+        &self,
+        ctx: &RequestContext,
+        dir: &Self::Handle,
+    ) -> FsResult<Option<Self::Handle>> {
+        self.inner.parent(ctx, dir).await
+    }
+    async fn readdir(
+        &self,
+        ctx: &RequestContext,
+        dir: &Self::Handle,
+        cookie: u64,
+        max_entries: u32,
+        with_attrs: bool,
+    ) -> FsResult<DirPage<Self::Handle>> {
+        self.inner
+            .readdir(ctx, dir, cookie, max_entries, with_attrs)
+            .await
+    }
+    async fn read(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        offset: u64,
+        count: u32,
+    ) -> FsResult<ReadResult> {
+        self.inner.read(ctx, handle, offset, count).await
+    }
+    async fn write(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        offset: u64,
+        data: Bytes,
+        requested: WriteStability,
+    ) -> FsResult<WriteResult> {
+        self.inner.write(ctx, handle, offset, data, requested).await
+    }
+    async fn create(
+        &self,
+        ctx: &RequestContext,
+        parent: &Self::Handle,
+        name: &str,
+        req: CreateRequest,
+    ) -> FsResult<CreateResult<Self::Handle>> {
+        self.inner.create(ctx, parent, name, req).await
+    }
+    async fn remove(
+        &self,
+        ctx: &RequestContext,
+        parent: &Self::Handle,
+        name: &str,
+    ) -> FsResult<()> {
+        self.inner.remove(ctx, parent, name).await
+    }
+    async fn rename(
+        &self,
+        ctx: &RequestContext,
+        from_dir: &Self::Handle,
+        from_name: &str,
+        to_dir: &Self::Handle,
+        to_name: &str,
+    ) -> FsResult<()> {
+        self.inner
+            .rename(ctx, from_dir, from_name, to_dir, to_name)
+            .await
+    }
+    async fn setattr(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        attrs: &SetAttrs,
+    ) -> FsResult<Attrs> {
+        self.inner.setattr(ctx, handle, attrs).await
+    }
+    fn symlinks(&self) -> Option<&dyn Symlinks<Self::Handle>> {
+        self.inner.symlinks()
+    }
+    fn hard_links(&self) -> Option<&dyn HardLinks<Self::Handle>> {
+        self.inner.hard_links()
+    }
+    fn xattrs(&self) -> Option<&dyn Xattrs<Self::Handle>> {
+        self.inner.xattrs()
+    }
+    fn commit_support(&self) -> Option<&dyn CommitSupport<Self::Handle>> {
+        self.inner.commit_support()
     }
 }
