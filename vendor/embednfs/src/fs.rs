@@ -678,6 +678,21 @@ pub trait OpenSupport<H>: Send + Sync {
     async fn open(&self, ctx: &RequestContext, handle: &H, request: OpenRequest) -> FsResult<()>;
 }
 
+/// Optional notifications about NFS open state.
+///
+/// `opened` is called whenever an OPEN creates an open state for an object
+/// and `released` once that state ends: by CLOSE, or when the server drops
+/// the client's state (lease expiry, client reboot, DESTROY_CLIENTID). The
+/// calls are balanced per open state, so a backend can keep a count and,
+/// for example, defer freeing an unlinked file until it is no longer open
+/// (POSIX "open-unlink"). Calls are synchronous and must be cheap.
+pub trait OpenTracking<H>: Send + Sync {
+    /// An open state was created for `handle`.
+    fn opened(&self, handle: &H);
+    /// An open state for `handle` ended.
+    fn released(&self, handle: &H);
+}
+
 /// Optional stable object identity.
 ///
 /// When a filesystem provides this, the server derives wire filehandles
@@ -833,6 +848,11 @@ pub trait FileSystem: Send + Sync + 'static {
 
     /// Returns optional explicit open support.
     fn open_support(&self) -> Option<&dyn OpenSupport<Self::Handle>> {
+        None
+    }
+
+    /// Returns optional open-state notifications. See [`OpenTracking`].
+    fn open_tracking(&self) -> Option<&dyn OpenTracking<Self::Handle>> {
         None
     }
 

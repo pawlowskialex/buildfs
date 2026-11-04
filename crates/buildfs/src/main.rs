@@ -7,6 +7,7 @@ use embednfs::NfsServer;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use buildfs::ids::SystemIdMapper;
 use buildfs::nfs::BuildFs;
 use buildfs::vfs::{Options, SyncMode, Vfs};
 
@@ -106,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             let server = NfsServer::builder(BuildFs::new(vfs.clone()))
                 .server_identity(Vfs::server_identity(&args.store)?)
                 .mandatory_io_locks(false)
+                .id_mapper(SystemIdMapper::default())
                 .build();
             tokio::select! {
                 r = server.serve(listener) => r?,
@@ -135,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             let server = NfsServer::builder(BuildFs::new(vfs.clone()))
                 .server_identity(Vfs::server_identity(&store)?)
                 .mandatory_io_locks(false)
+                .id_mapper(SystemIdMapper::default())
                 .build();
             let serve = tokio::spawn(server.serve(listener));
 

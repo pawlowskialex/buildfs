@@ -79,6 +79,9 @@ pub(super) struct StateInner {
     pub open_files: HashMap<[u8; 12], OpenFileState>,
     pub lock_files: HashMap<[u8; 12], LockFileState>,
     pub metadata: HashMap<ServerObject, SynthMeta>,
+    /// Objects whose open states ended (CLOSE, revocation, client expiry)
+    /// since the last drain; see `StateManager::take_released_opens`.
+    pub released_opens: Vec<ServerObject>,
 }
 
 #[derive(Debug)]

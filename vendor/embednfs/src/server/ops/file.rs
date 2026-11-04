@@ -282,13 +282,13 @@ impl<F: FileSystem> NfsServer<F> {
                             };
                             let set_attrs = match how {
                                 Createhow4::Unchecked(fa) | Createhow4::Guarded(fa) => {
-                                    match attrs::decode_setattr(fa) {
+                                    match attrs::decode_setattr(fa, self.id_mapper.as_ref()) {
                                         Ok(attrs) => attrs,
                                         Err(status) => return NfsResop4::Open(status, None),
                                     }
                                 }
                                 Createhow4::Exclusive4_1 { attrs: fa, .. } => {
-                                    match attrs::decode_setattr(fa) {
+                                    match attrs::decode_setattr(fa, self.id_mapper.as_ref()) {
                                         Ok(attrs) => attrs,
                                         Err(status) => return NfsResop4::Open(status, None),
                                     }
@@ -352,13 +352,13 @@ impl<F: FileSystem> NfsServer<F> {
                             };
                             let set_attrs = match how {
                                 Createhow4::Unchecked(fa) | Createhow4::Guarded(fa) => {
-                                    match attrs::decode_setattr(fa) {
+                                    match attrs::decode_setattr(fa, self.id_mapper.as_ref()) {
                                         Ok(attrs) => attrs,
                                         Err(status) => return NfsResop4::Open(status, None),
                                     }
                                 }
                                 Createhow4::Exclusive4_1 { attrs: fa, .. } => {
-                                    match attrs::decode_setattr(fa) {
+                                    match attrs::decode_setattr(fa, self.id_mapper.as_ref()) {
                                         Ok(attrs) => attrs,
                                         Err(status) => return NfsResop4::Open(status, None),
                                     }
@@ -453,6 +453,12 @@ impl<F: FileSystem> NfsServer<F> {
             Ok(stateid) => stateid,
             Err(status) => return NfsResop4::Open(status, None),
         };
+        if let ServerObject::Fs(id) = &object
+            && let Some(tracking) = self.fs.open_tracking()
+            && let Ok(handle) = self.resolve_backend_handle(*id).await
+        {
+            tracking.opened(&handle);
+        }
 
         *current_fh = Some(self.state.object_to_fh(&object));
 
@@ -480,7 +486,15 @@ impl<F: FileSystem> NfsServer<F> {
             Some(OpenRes4 {
                 stateid,
                 cinfo,
-                rflags: OPEN4_RESULT_LOCKTYPE_POSIX,
+                // A backend that tracks open state can keep unlinked open
+                // files alive, so clients may REMOVE instead of renaming the
+                // file to a hidden `.nfs*` name (RFC 8881 §18.16.4).
+                rflags: OPEN4_RESULT_LOCKTYPE_POSIX
+                    | if self.fs.open_tracking().is_some() {
+                        OPEN4_RESULT_PRESERVE_UNLINKED
+                    } else {
+                        0
+                    },
                 attrset: Bitmap4::new(),
                 delegation: OpenDelegation4::None,
             }),

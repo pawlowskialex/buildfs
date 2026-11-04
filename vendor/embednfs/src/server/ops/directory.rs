@@ -37,7 +37,7 @@ impl<F: FileSystem> NfsServer<F> {
             Err(e) => return NfsResop4::Create(e.to_nfsstat4(), None, Bitmap4::new()),
         };
 
-        let set_attrs = match attrs::decode_setattr(&args.createattrs) {
+        let set_attrs = match attrs::decode_setattr(&args.createattrs, self.id_mapper.as_ref()) {
             Ok(attrs) => attrs,
             Err(status) => return NfsResop4::Create(status, None, Bitmap4::new()),
         };

@@ -9,6 +9,7 @@
 
 pub mod cold;
 pub mod hot;
+pub mod ids;
 pub mod meta;
 pub mod nfs;
 pub mod vfs;

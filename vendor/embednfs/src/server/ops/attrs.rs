@@ -96,7 +96,7 @@ impl<F: FileSystem> NfsServer<F> {
             Err(status) => return NfsResop4::Setattr(status, Bitmap4::new()),
         };
 
-        let set_attrs = match attrs::decode_setattr(&args.obj_attributes) {
+        let set_attrs = match attrs::decode_setattr(&args.obj_attributes, self.id_mapper.as_ref()) {
             Ok(attrs) => attrs,
             Err(status) => return NfsResop4::Setattr(status, Bitmap4::new()),
         };

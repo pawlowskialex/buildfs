@@ -371,6 +371,13 @@ impl StateManager {
     }
 
     fn revoke_client_state(inner: &mut StateInner, clientid: Clientid4) {
+        let released: Vec<_> = inner
+            .open_files
+            .values()
+            .filter(|state| state.clientid == clientid && state.active)
+            .map(|state| state.object.clone())
+            .collect();
+        inner.released_opens.extend(released);
         inner
             .open_files
             .retain(|_, state| state.clientid != clientid);

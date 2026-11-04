@@ -282,6 +282,7 @@ impl<F: FileSystem> NfsServer<F> {
                 session_limits,
             )
             .await;
+        self.notify_released_opens().await;
         tracing::trace!(
             target: "embednfs::timing",
             "compound {:?} took {:?} status={:?}",

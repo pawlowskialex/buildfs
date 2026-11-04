@@ -31,6 +31,20 @@ impl<F: FileSystem> NfsServer<F> {
         id
     }
 
+    /// Forwards ended open states to the backend's [`crate::OpenTracking`].
+    pub(super) async fn notify_released_opens(&self) {
+        let Some(tracking) = self.fs.open_tracking() else {
+            return;
+        };
+        for object in self.state.take_released_opens().await {
+            if let ServerObject::Fs(id) = object
+                && let Ok(handle) = self.resolve_backend_handle(id).await
+            {
+                tracking.released(&handle);
+            }
+        }
+    }
+
     pub(super) async fn object_from_handle(&self, handle: &F::Handle) -> ServerObject {
         ServerObject::Fs(self.register_handle(handle).await)
     }

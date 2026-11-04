@@ -179,6 +179,7 @@ struct W<'t> {
     counters: Table<'t, &'static str, u64>,
     inline: Table<'t, u64, &'static [u8]>,
     change: &'t AtomicU64,
+    open_counts: &'t Mutex<std::collections::HashMap<Ino, u32>>,
     /// Data files to delete once the transaction has committed.
     drop_data: Vec<DropData>,
     /// Redo record for the WAL; every table write goes through a helper
@@ -304,6 +305,18 @@ impl W<'_> {
             self.touch_ctime(&mut inode);
             return self.put(ino, &inode);
         }
+        // Still open somewhere: keep the inode (nlink 0) until the last
+        // open state ends. Checked inside the write transaction, which
+        // serializes against `Vfs::open_released`.
+        if inode.kind != Kind::Dir && self.open_counts.lock().contains_key(&ino) {
+            self.touch_ctime(&mut inode);
+            return self.put(ino, &inode);
+        }
+        self.free_inode(ino, inode)
+    }
+
+    /// Deletes an inode with no links left, with its xattrs and data.
+    fn free_inode(&mut self, ino: Ino, inode: Inode) -> Result<()> {
         self.del_inode(ino)?;
         if inode.xattr_count > 0 {
             let names: Vec<String> = self
@@ -423,6 +436,8 @@ pub struct Vfs {
     compactor_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     rehydrate_lock: Mutex<()>,
     stats: Mutex<CompressStats>,
+    /// Active NFS open states per inode (see `open_acquired`).
+    open_counts: Mutex<std::collections::HashMap<Ino, u32>>,
     wal: Mutex<Wal>,
     sync_mode: SyncMode,
     change: AtomicU64,
@@ -480,6 +495,7 @@ impl Vfs {
             compactor_threads: Mutex::new(Vec::new()),
             rehydrate_lock: Mutex::new(()),
             stats: Mutex::new(CompressStats::default()),
+            open_counts: Mutex::new(std::collections::HashMap::new()),
             // Placeholder segment numbering is fixed up after replay below.
             wal: Mutex::new(Wal::open(&wal_dir)?),
             sync_mode,
@@ -490,6 +506,7 @@ impl Vfs {
         });
         vfs.init_schema().map_err(|e| anyhow::anyhow!("init failed: {e:?}"))?;
         vfs.replay_wal(&pending)?;
+        vfs.free_orphans().map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e:?}"))?;
         vfs.gc_data().map_err(|e| anyhow::anyhow!("gc failed: {e:?}"))?;
         Self::spawn_flusher(&vfs, options.flush_interval);
         if vfs.compress_after.is_some() {
@@ -617,6 +634,75 @@ impl Vfs {
             warn!("recovered {applied} metadata transactions from the WAL");
         }
         Ok(())
+    }
+
+    /// Frees files that were unlinked while open when the previous process
+    /// stopped. Open state never survives a restart.
+    fn free_orphans(&self) -> Result<()> {
+        let orphans: Vec<Ino> = {
+            let txn = self.db.begin_read().db()?;
+            let inodes = txn.open_table(INODES).db()?;
+            let mut out = Vec::new();
+            for entry in inodes.iter().db()? {
+                let (k, v) = entry.db()?;
+                if Inode::decode(v.value()).is_ok_and(|i| i.nlink == 0 && i.kind != Kind::Dir) {
+                    out.push(k.value());
+                }
+            }
+            out
+        };
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        let n = orphans.len();
+        self.write(|w| {
+            for ino in orphans {
+                let inode = w.get(ino)?;
+                w.free_inode(ino, inode)?;
+            }
+            Ok(())
+        })?;
+        info!("freed {n} files that were unlinked while open");
+        Ok(())
+    }
+
+    // ----- open tracking ------------------------------------------------------
+
+    /// An NFS open state was created for `ino`.
+    pub fn open_acquired(&self, ino: Ino) {
+        *self.open_counts.lock().entry(ino).or_insert(0) += 1;
+    }
+
+    /// An NFS open state for `ino` ended; frees the inode if it was the last
+    /// one and the file has been unlinked meanwhile.
+    pub fn open_released(&self, ino: Ino) {
+        {
+            let mut counts = self.open_counts.lock();
+            match counts.get_mut(&ino) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    return;
+                }
+                Some(_) => {
+                    let _ = counts.remove(&ino);
+                }
+                None => return,
+            }
+        }
+        let r = self.write(|w| {
+            let inode = match w.get(ino) {
+                Ok(i) => i,
+                Err(FsError::Stale) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+            if inode.nlink == 0 && inode.kind != Kind::Dir && !w.open_counts.lock().contains_key(&ino) {
+                w.free_inode(ino, inode)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = r {
+            warn!("failed to free unlinked inode {ino}: {e:?}");
+        }
     }
 
     /// Deletes data files no inode references (crash leftovers) and queues
@@ -758,6 +844,7 @@ impl Vfs {
                 counters: txn.open_table(COUNTERS).db()?,
                 inline: txn.open_table(INLINE).db()?,
                 change: &self.change,
+                open_counts: &self.open_counts,
                 drop_data: Vec::new(),
                 log: Vec::new(),
             };

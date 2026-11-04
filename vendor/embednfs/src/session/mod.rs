@@ -152,6 +152,7 @@ impl StateManager {
                 open_files: HashMap::new(),
                 lock_files: HashMap::new(),
                 metadata: HashMap::new(),
+                released_opens: Vec::new(),
             })),
             fh_to_object: DashMap::new(),
             object_to_fh: DashMap::new(),

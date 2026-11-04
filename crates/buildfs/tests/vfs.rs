@@ -647,3 +647,45 @@ fn every_xattr_is_stored_including_provenance() {
     assert!(vfs.xattr_exists(f, "com.apple.provenance").unwrap());
     assert_eq!(vfs.get_xattr(f, "com.apple.provenance").unwrap(), b"\x01\x02");
 }
+
+#[test]
+fn unlinked_open_files_live_until_last_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "tmpfile");
+    vfs.write_data(f, 0, b"Hello, World!").unwrap();
+    vfs.open_acquired(f);
+    vfs.open_acquired(f);
+    vfs.remove(ROOT_INO, "tmpfile").unwrap();
+    assert_eq!(vfs.lookup(ROOT_INO, "tmpfile").err(), Some(FsError::NotFound));
+    assert_eq!(vfs.getattr(f).unwrap().nlink, 0);
+    assert_eq!(read_all(&vfs, f), b"Hello, World!".to_vec());
+    vfs.write_data(f, 0, b"J").unwrap();
+    vfs.open_released(f);
+    assert_eq!(read_all(&vfs, f), b"Jello, World!".to_vec());
+    vfs.open_released(f);
+    assert_eq!(vfs.getattr(f).err(), Some(FsError::Stale));
+    // Files closed before unlink are freed immediately, as before.
+    let g = mkfile(&vfs, ROOT_INO, "g");
+    vfs.open_acquired(g);
+    vfs.open_released(g);
+    vfs.remove(ROOT_INO, "g").unwrap();
+    assert_eq!(vfs.getattr(g).err(), Some(FsError::Stale));
+}
+
+#[test]
+fn orphans_are_freed_on_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f;
+    {
+        let vfs = Vfs::open(tmp.path()).unwrap();
+        f = mkfile(&vfs, ROOT_INO, "held");
+        vfs.write_data(f, 0, &artifact(10_000)).unwrap();
+        vfs.open_acquired(f);
+        vfs.remove(ROOT_INO, "held").unwrap();
+        vfs.shutdown();
+    }
+    let vfs = Vfs::open(tmp.path()).unwrap();
+    assert_eq!(vfs.getattr(f).err(), Some(FsError::Stale));
+    assert!(walk(&tmp.path().join("hot")).is_empty());
+}

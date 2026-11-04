@@ -14,11 +14,11 @@ pub(crate) mod session;
 pub use fs::{
     AccessMask, Attrs, AuthContext, CloseSupport, CommitSupport, CreateKind, CreateRequest,
     CreateResult, DirEntry, DirPage, FileSystem, FsCapabilities, FsError, FsLimits, FsResult,
-    FsStats, HardLinks, ObjectType, OpenRequest, OpenSupport, ReadResult, RequestContext, SetAttrs,
+    FsStats, HardLinks, ObjectType, OpenRequest, OpenSupport, OpenTracking, ReadResult, RequestContext, SetAttrs,
     SetTime, StableHandles, Symlinks, Timestamp, WriteResult, WriteStability, XattrSetMode, Xattrs,
 };
 pub use memfs::MemFs;
 pub use server::{
     DEFAULT_MAX_CONCURRENT_REQUESTS, IdMapper, MAX_CONCURRENT_REQUESTS_LIMIT, NfsServer,
-    NfsServerBuilder, NumericIdMapper,
+    NfsServerBuilder, NumericIdMapper, parse_numeric_id,
 };

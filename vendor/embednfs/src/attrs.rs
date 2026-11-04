@@ -265,7 +265,8 @@ pub(crate) fn encode_fattr4(
     // FATTR4_MAXLINK (28)
     if request.is_set(FATTR4_MAXLINK) {
         result_bitmap.set(FATTR4_MAXLINK);
-        255u32.encode(&mut vals);
+        // Matches APFS; backends keep 32-bit link counts.
+        32767u32.encode(&mut vals);
     }
 
     // FATTR4_MAXNAME (29)
@@ -443,7 +444,10 @@ pub(crate) fn encode_fattr4(
 }
 
 /// Decode setattr attributes from an Fattr4.
-pub(crate) fn decode_setattr(fattr: &Fattr4) -> Result<SetAttrs, NfsStat4> {
+pub(crate) fn decode_setattr(
+    fattr: &Fattr4,
+    ids: &dyn crate::server::IdMapper,
+) -> Result<SetAttrs, NfsStat4> {
     let mut result = SetAttrs::default();
     let mut src = fattr.attr_vals.clone();
 
@@ -472,19 +476,12 @@ pub(crate) fn decode_setattr(fattr: &Fattr4) -> Result<SetAttrs, NfsStat4> {
 
     if fattr.attrmask.is_set(FATTR4_OWNER) {
         let owner_str = String::decode(&mut src).map_err(|_| NfsStat4::BadXdr)?;
-        // Parse numeric uid or "uid@domain" format
-        let uid_str = owner_str.split('@').next().unwrap_or(&owner_str);
-        if let Ok(uid) = uid_str.parse::<u32>() {
-            result.uid = Some(uid);
-        }
+        result.uid = Some(ids.parse_owner(&owner_str).ok_or(NfsStat4::BadOwner)?);
     }
 
     if fattr.attrmask.is_set(FATTR4_OWNER_GROUP) {
         let group_str = String::decode(&mut src).map_err(|_| NfsStat4::BadXdr)?;
-        let gid_str = group_str.split('@').next().unwrap_or(&group_str);
-        if let Ok(gid) = gid_str.parse::<u32>() {
-            result.gid = Some(gid);
-        }
+        result.gid = Some(ids.parse_group(&group_str).ok_or(NfsStat4::BadOwner)?);
     }
 
     // SYSTEM (46) - macOS sends this
@@ -559,7 +556,7 @@ mod tests {
         let attrs = decode_setattr(&Fattr4 {
             attrmask: bitmap,
             attr_vals: vals.freeze(),
-        })
+        }, &crate::server::NumericIdMapper)
         .unwrap();
 
         assert_eq!(attrs.mode, Some(0o644));
@@ -577,7 +574,7 @@ mod tests {
         let err = decode_setattr(&Fattr4 {
             attrmask: bitmap,
             attr_vals: vals.freeze(),
-        })
+        }, &crate::server::NumericIdMapper)
         .unwrap_err();
 
         assert_eq!(err, NfsStat4::BadXdr);

@@ -26,3 +26,11 @@ Tracked in git history of this repo. Summary kept below.
   macOS (e.g. its AppleDouble code) locks then reads via the open stateid.
 - **`Xattrs::xattr_exists`** hook used by named-attribute LOOKUP and OPEN
   existence checks (defaults to probing `get_xattr`).
+- **`OpenTracking`** hook (`opened`/`released`, balanced per open state incl.
+  CLOSE, revocation, client expiry) and `OPEN4_RESULT_PRESERVE_UNLINKED`
+  when present, so clients REMOVE open files instead of `.nfs*` renames.
+- **Owner strings**: `IdMapper::parse_owner/parse_group`; SETATTR with an
+  unmappable owner now fails with NFS4ERR_BADOWNER. Previously anything
+  non-numeric (macOS sends `root`, `wheel@host`, `EVERYONE@`) was silently
+  ignored, so chown/chgrp "succeeded" without effect.
+- `maxlink` advertised as 32767 (was 255).

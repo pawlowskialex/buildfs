@@ -109,10 +109,22 @@ impl StateManager {
             .ok_or(NfsStat4::BadStateid)?;
         state.active = false;
         state.stateid_seq = stored_seq.wrapping_add(1);
+        let object = state.object.clone();
+        let seqid = state.stateid_seq;
+        inner.released_opens.push(object);
         Ok(Stateid4 {
-            seqid: state.stateid_seq,
+            seqid,
             other: stateid.other,
         })
+    }
+
+    /// Drains objects whose open states ended since the last call.
+    pub(crate) async fn take_released_opens(&self) -> Vec<ServerObject> {
+        let mut inner = self.inner.write().await;
+        if inner.released_opens.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut inner.released_opens)
     }
 
     /// Free a stateid.

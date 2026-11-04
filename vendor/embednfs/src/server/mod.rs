@@ -71,6 +71,26 @@ pub trait IdMapper: Send + Sync + 'static {
 
     /// Maps a numeric gid to an NFS owner-group string.
     fn group(&self, gid: u32) -> String;
+
+    /// Parses an owner string sent by a client (SETATTR, CREATE, OPEN).
+    /// `None` makes the request fail with `NFS4ERR_BADOWNER`.
+    ///
+    /// The default accepts numeric ids, optionally with an `@domain` suffix.
+    /// Clients such as macOS send names (`root`, `user@host.local`), so
+    /// mappers should resolve those too.
+    fn parse_owner(&self, owner: &str) -> Option<u32> {
+        parse_numeric_id(owner)
+    }
+
+    /// Parses an owner-group string; see [`IdMapper::parse_owner`].
+    fn parse_group(&self, group: &str) -> Option<u32> {
+        parse_numeric_id(group)
+    }
+}
+
+/// Parses `"123"` or `"123@domain"`.
+pub fn parse_numeric_id(s: &str) -> Option<u32> {
+    s.split('@').next().unwrap_or(s).parse().ok()
 }
 
 /// Default id mapper that renders numeric ids directly.

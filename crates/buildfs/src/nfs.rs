@@ -10,6 +10,7 @@ use bytes::Bytes;
 use embednfs::{
     AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
     FileSystem, FsCapabilities, FsError, FsLimits, FsResult, FsStats, HardLinks, ObjectType,
+    OpenTracking,
     ReadResult, RequestContext, SetAttrs, StableHandles, Symlinks, Timestamp, WriteResult,
     WriteStability, XattrSetMode, Xattrs,
 };
@@ -310,6 +311,23 @@ impl FileSystem for BuildFs {
 
     fn stable_handles(&self) -> Option<&dyn StableHandles<Ino>> {
         Some(self)
+    }
+
+    fn open_tracking(&self) -> Option<&dyn OpenTracking<Ino>> {
+        Some(self)
+    }
+}
+
+impl OpenTracking<Ino> for BuildFs {
+    fn opened(&self, handle: &Ino) {
+        self.vfs.open_acquired(*handle);
+    }
+
+    fn released(&self, handle: &Ino) {
+        // Freeing an unlinked file is a metadata transaction plus file
+        // deletion: keep it off the async worker.
+        let (vfs, ino) = (self.vfs.clone(), *handle);
+        drop(tokio::task::spawn_blocking(move || vfs.open_released(ino)));
     }
 }
 
