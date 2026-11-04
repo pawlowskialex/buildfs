@@ -8,6 +8,11 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 mod agent;
+mod attach;
+mod integrate;
+mod mounts;
+
+use mounts::{mounted_from, nfs_mount_port, resolve_mountpoint};
 
 use buildfs::ids::SystemIdMapper;
 use buildfs::nfs::BuildFs;
@@ -111,6 +116,43 @@ enum Cmd {
         #[arg(long, default_value = "default")]
         name: String,
     },
+    /// Point toolchains' artifact/cache locations at the mount (rust, xcode,
+    /// go, uv, or `all`). Without tools: show status and what would change.
+    Integrate {
+        tools: Vec<String>,
+        /// Mount to use (default: the only buildfs mount).
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        /// Remove settings that point at buildfs.
+        #[arg(long)]
+        revert: bool,
+    },
+    /// Store a project directory (node_modules, .build, build/, ...) on
+    /// buildfs by mounting a store subtree there.
+    Attach {
+        #[arg(required = true)]
+        dirs: Vec<PathBuf>,
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        /// Move existing contents into buildfs instead of refusing.
+        #[arg(long = "move")]
+        move_contents: bool,
+    },
+    /// Undo `attach`; the directory is left empty unless --keep.
+    Detach {
+        #[arg(required = true)]
+        dirs: Vec<PathBuf>,
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        /// Copy the contents back into the (local) directory.
+        #[arg(long)]
+        keep: bool,
+    },
+    /// List attached directories.
+    Attachments {
+        #[arg(long)]
+        mount: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -190,9 +232,7 @@ async fn main() -> anyhow::Result<()> {
                 .build();
             let serve = tokio::spawn(server.serve(listener));
 
-            // namedattr: xattrs are stored natively instead of in `._` files.
-            let mut opts =
-                format!("vers=4.1,tcp,port={port},nobrowse,namedattr,rsize=1048576,wsize=1048576");
+            let mut opts = mounts::mount_options(port);
             if let Some(extra) = options {
                 opts.push(',');
                 opts.push_str(&extra);
@@ -211,6 +251,12 @@ async fn main() -> anyhow::Result<()> {
                 vfs.shutdown();
                 bail!("mount_nfs failed: {status}");
             }
+            {
+                // Mounting attachments talks to our own server, which runs
+                // on the runtime's worker threads.
+                let (root, port) = (mountpoint.clone(), port);
+                let _ = tokio::task::spawn_blocking(move || attach::restore(&root, port)).await;
+            }
             info!(
                 "{} 127.0.0.1:/ at {} (store {})",
                 if adopt { "serving existing mount" } else { "mounted" },
@@ -228,6 +274,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             if !keep_mounted {
+                // Attachments first: they keep the server busy otherwise.
+                for a in attach::load(&mountpoint) {
+                    if mounted_from(&a.path).is_some() {
+                        let _ = tokio::task::spawn_blocking(move || mounts::unmount(&a.path)).await;
+                    }
+                }
                 unmount(&mountpoint).await;
             }
             log_stats(&vfs);
@@ -244,6 +296,18 @@ async fn main() -> anyhow::Result<()> {
             name,
         } => agent::install(&args, &mountpoint, port, &name)?,
         Cmd::UninstallAgent { name } => agent::uninstall(&name)?,
+        Cmd::Integrate {
+            tools,
+            mount,
+            revert,
+        } => integrate::run(&tools, mount.as_deref(), revert)?,
+        Cmd::Attach {
+            dirs,
+            mount,
+            move_contents,
+        } => attach::attach(&dirs, mount.as_deref(), move_contents)?,
+        Cmd::Detach { dirs, mount, keep } => attach::detach(&dirs, mount.as_deref(), keep)?,
+        Cmd::Attachments { mount } => attach::print_list(mount.as_deref())?,
     }
     Ok(())
 }
@@ -267,55 +331,6 @@ fn log_stats(vfs: &Vfs) {
     if let Ok((bytes, n)) = vfs.chunk_usage() {
         info!("chunk store: {n} distinct chunks, {:.1} MiB", bytes as f64 / 1048576.0);
     }
-}
-
-/// Absolute mountpoint path without touching the mountpoint itself.
-fn resolve_mountpoint(p: &std::path::Path) -> anyhow::Result<PathBuf> {
-    let name = p.file_name().context("mountpoint needs a final component")?;
-    let parent = match p.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    Ok(std::fs::canonicalize(&parent).context("mountpoint parent")?.join(name))
-}
-
-/// The `f_mntfromname` of a mount at exactly `path`, using cached mount
-/// info (MNT_NOWAIT) so dead mounts are never contacted.
-fn mounted_from(path: &std::path::Path) -> Option<String> {
-    let mut list: *mut libc::statfs = std::ptr::null_mut();
-    // SAFETY: getmntinfo fills `list` with a pointer to an internal array of
-    // `n` entries that stays valid until the next call; we only read it.
-    let n = unsafe { libc::getmntinfo(&mut list, libc::MNT_NOWAIT) };
-    if n <= 0 || list.is_null() {
-        return None;
-    }
-    // SAFETY: as above, `list` points to `n` initialized entries.
-    let mounts = unsafe { std::slice::from_raw_parts(list, n as usize) };
-    let want = path.as_os_str().as_encoded_bytes();
-    mounts.iter().find_map(|m| {
-        // SAFETY: f_mntonname/f_mntfromname are NUL-terminated C strings.
-        let on = unsafe { std::ffi::CStr::from_ptr(m.f_mntonname.as_ptr()) };
-        (on.to_bytes() == want).then(|| {
-            // SAFETY: see above.
-            unsafe { std::ffi::CStr::from_ptr(m.f_mntfromname.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        })
-    })
-}
-
-/// Server port of an NFS mount, from `nfsstat -m` (kernel mount info only;
-/// never contacts the server).
-fn nfs_mount_port(mountpoint: &std::path::Path) -> Option<u16> {
-    let out = std::process::Command::new("/usr/bin/nfsstat").arg("-m").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let header = format!("{} from ", mountpoint.display());
-    let lines = text.lines().skip_while(|l| !l.starts_with(&header)).skip(1);
-    lines
-        .take_while(|l| l.starts_with(' '))
-        .find(|l| l.contains("NFS parameters:"))
-        .and_then(|l| l.split([',', ' ']).find_map(|kv| kv.strip_prefix("port=")))
-        .and_then(|p| p.parse().ok())
 }
 
 async fn force_unmount(mountpoint: &std::path::Path) {

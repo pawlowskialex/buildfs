@@ -33,6 +33,39 @@ buildfs uninstall-agent          # unmounts and removes the agent
 | `--sync relaxed\|strict` | relaxed | see Durability |
 | `-o <opts>` | | extra `mount_nfs` options |
 
+## Integrating with toolchains
+
+**Global settings, no per-project changes.** `buildfs integrate` shows the
+status and what it would change; `buildfs integrate rust xcode go uv` (or
+`all`) applies, and `--revert` undoes. It never overwrites a value you set
+yourself.
+
+| Tool | Setting | Moves |
+|---|---|---|
+| Rust | `~/.cargo/config.toml` `[build] build-dir = "<mnt>/cargo/{workspace-path-hash}"` | deps, incremental, build scripts of every workspace; final binaries stay in `target/`; `cargo clean` still works |
+| Xcode | `defaults write com.apple.dt.Xcode IDECustomDerivedDataLocation <mnt>/xcode/DerivedData` | DerivedData (Xcode and xcodebuild) |
+| Go | `go env -w GOCACHE=<mnt>/go/cache` | build cache |
+| uv | `~/.config/uv/uv.toml` `cache-dir` | Python package cache |
+| Zig, Gradle, Python bytecode | `ZIG_GLOBAL_CACHE_DIR`, `GRADLE_USER_HOME`, `PYTHONPYCACHEPREFIX` | printed for your shell profile (env-only tools) |
+
+These go through each tool's own configuration, so IDEs (rust-analyzer,
+Xcode, gopls) and scripts pick them up too.
+
+**Per-project directories.** `node_modules`, `.next`, SwiftPM `.build`,
+Gradle/CMake `build/` and `.venv` have no global setting. Symlinks aren't
+reliable (npm replaces a symlinked `node_modules` with a real directory),
+so `buildfs attach <dir>` mounts a store subtree at that path instead.
+Tools see an ordinary directory, and `.gitignore` keeps working.
+Attachments are recorded in the store and restored when buildfs starts;
+`buildfs attachments` lists them, and `buildfs detach [--keep] <dir>` undoes
+one.
+
+**What fits.** Compiler outputs (Rust, Xcode, Go, Swift, C++) are few,
+large, write-once files: ideal. `node_modules` shrinks well too (a Next.js
+app: 336 MB to 116 MB), but creating or reading thousands of tiny files
+costs about 2.5 ms each over NFS, so `npm install` took 22 s instead of 4 s.
+Attach it when disk space matters more than install time.
+
 ## Results
 
 Debug builds of this workspace (M-series Mac, APFS):
@@ -180,6 +213,8 @@ upstream. The ones that matter most:
 ## Roadmap
 
 - `buildfs stats` for a live mount (store usage, dedup ratio).
+- More integrations: Bazel `--output_user_root`, ccache/sccache config,
+  Gradle via `gradle.properties` where possible.
 - Garbage collection for stale artifacts (e.g. drop chunks of files unread
   for N days), a store size limit.
 - Pursue upstreaming the embednfs patches.

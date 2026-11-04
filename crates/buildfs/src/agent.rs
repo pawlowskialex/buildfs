@@ -155,6 +155,11 @@ pub fn uninstall(name: &str) -> anyhow::Result<()> {
     // Unmount from this (interactive) process while the agent still serves,
     // so the unmount can complete; then stop the agent.
     if let Some(mnt) = installed_mountpoint(&path) {
+        for a in crate::attach::load(&mnt) {
+            if crate::mounts::mounted_from(&a.path).is_some() {
+                let _ = crate::mounts::unmount(&a.path);
+            }
+        }
         let ok = Command::new("/sbin/umount").arg(&mnt).status().is_ok_and(|s| s.success());
         if !ok {
             let _ = Command::new("/sbin/umount").arg("-f").arg(&mnt).status();
