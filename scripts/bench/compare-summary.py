@@ -19,13 +19,13 @@ for line in open(sys.argv[1]):
     if m:
         d.setdefault(f"par_oc {m.group(1)}-way (opens/s x2)", {}).setdefault(cur, []).append(float(m.group(2)))
         continue
-    m = re.match(r"(\S.*?)\s{2,}([\d.]+) us/op", line)
-    if m:
-        d.setdefault(m.group(1).strip() + " (us)", {}).setdefault(cur, []).append(float(m.group(2)))
-        continue
     m = re.search(r"link:\s+([\d.]+)", line)
     if m:
         d.setdefault("hard link (us)", {}).setdefault(cur, []).append(float(m.group(1)))
+        continue
+    m = re.match(r"(\S.*?)\s{2,}([\d.]+) us/op", line)
+    if m:
+        d.setdefault(m.group(1).strip() + " (us)", {}).setdefault(cur, []).append(float(m.group(2)))
         continue
     m = re.match(r"cargo (\w+): ([\d.]+) s", line)
     if m:

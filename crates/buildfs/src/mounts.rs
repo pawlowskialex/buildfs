@@ -1,4 +1,5 @@
-//! Inspecting and creating NFS mounts without touching possibly dead ones.
+//! Inspecting and creating mounts (NFS and FSKit) without touching possibly
+//! dead ones.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +27,75 @@ pub fn mount_nfs(port: u16, export: &str, dir: &Path, extra: Option<&str>) -> an
         bail!("mount_nfs {export} on {} failed: {status}", dir.display());
     }
     Ok(())
+}
+
+/// Options every FSKit mount gets. `owners`: without it XNU silently drops
+/// chown/chgrp on the volume. `nobrowse`: keep it out of Finder.
+const FSKIT_OPTIONS: &str = "owners,nobrowse";
+
+/// Prefix of the stores behind FSKit attachments (see `attach`).
+pub const FSKIT_ATTACH_PREFIX: &str = "att-";
+
+/// Checks a store name: it becomes the host of `buildfs://<name>`.
+pub fn validate_store_name(name: &str) -> anyhow::Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !ok {
+        bail!("store name {name:?} may only contain a-z, 0-9 and '-' (64 at most), and can't start with '-'");
+    }
+    Ok(())
+}
+
+/// The URL of an FSKit store.
+pub fn fskit_url(store: &str) -> String {
+    format!("buildfs://{store}")
+}
+
+/// The store behind an FSKit mount, from its `f_mntfromname`.
+pub fn fskit_store(from: &str) -> Option<&str> {
+    from.strip_prefix("buildfs://").map(|s| s.trim_end_matches('/'))
+}
+
+/// Mounts FSKit store `store` at `dir`. `fskitd` starts the extension;
+/// no process of ours stays behind. Retries a few times: the system may
+/// still be starting up (login) or registering the module (reinstall).
+pub fn mount_fskit(store: &str, dir: &Path, extra: &[String]) -> anyhow::Result<()> {
+    let mut opts = FSKIT_OPTIONS.to_owned();
+    for e in extra {
+        opts.push(',');
+        opts.push_str(e);
+    }
+    let url = fskit_url(store);
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        let status = Command::new("/sbin/mount")
+            .args(["-F", "-t", "buildfs", "-o", &opts, &url])
+            .arg(dir)
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    bail!(
+        "mounting {url} on {} failed. Is the module installed (fskit/install.sh) and enabled \
+         (System Settings > General > Login Items & Extensions > File System Extensions)?",
+        dir.display()
+    )
+}
+
+/// Deletes an FSKit store. Its directory is in the extension's sandbox
+/// container, which only the extension can touch, so this mounts the store
+/// emptied, with the option that deletes it on close.
+pub fn discard_fskit_store(store: &str) -> anyhow::Result<()> {
+    let dir = std::env::temp_dir().join(format!("buildfs-discard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let r = mount_fskit(store, &dir, &["fresh".into(), "discard".into()]).and_then(|()| unmount(&dir));
+    let _ = std::fs::remove_dir(&dir);
+    r
 }
 
 /// Unmounts `dir`, forcing if a plain unmount fails.
@@ -65,14 +135,34 @@ pub fn all_mounts() -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// How a buildfs root is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backend {
+    /// Our NFS server on this port.
+    Nfs { port: u16 },
+    /// The FSKit module, serving this store.
+    Fskit { store: String },
+}
+
+/// A mounted buildfs root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Root {
+    pub path: PathBuf,
+    pub backend: Backend,
+}
+
+/// Whether `from` is a root rather than an attachment or something else.
+fn is_root(from: &str) -> bool {
+    from == "127.0.0.1:/"
+        || from == "localhost:/"
+        || fskit_store(from).is_some_and(|s| !s.starts_with(FSKIT_ATTACH_PREFIX))
+}
+
 /// The buildfs root mount to operate on: `explicit` if given, otherwise the
-/// only mount of `127.0.0.1:/`. Returns `(mountpoint, port)`.
-pub fn find_root_mount(explicit: Option<&Path>) -> anyhow::Result<(PathBuf, u16)> {
-    let roots: Vec<PathBuf> = all_mounts()
-        .into_iter()
-        .filter(|(_, from)| from == "127.0.0.1:/" || from == "localhost:/")
-        .map(|(on, _)| on)
-        .collect();
+/// only root mounted (NFS or FSKit).
+pub fn find_root_mount(explicit: Option<&Path>) -> anyhow::Result<Root> {
+    let mounted: Vec<(PathBuf, String)> = all_mounts().into_iter().filter(|(_, from)| is_root(from)).collect();
+    let roots: Vec<PathBuf> = mounted.iter().map(|(on, _)| on.clone()).collect();
     let mnt = match explicit {
         Some(p) => {
             let p = resolve_mountpoint(p)?;
@@ -87,8 +177,14 @@ pub fn find_root_mount(explicit: Option<&Path>) -> anyhow::Result<(PathBuf, u16)
             _ => bail!("several buildfs mounts found; pick one with --mount"),
         },
     };
-    let port = nfs_mount_port(&mnt).context("could not determine the server port")?;
-    Ok((mnt, port))
+    let from = mounted.iter().find(|(on, _)| *on == mnt).map_or("", |(_, from)| from.as_str());
+    let backend = match fskit_store(from) {
+        Some(store) => Backend::Fskit { store: store.to_owned() },
+        None => Backend::Nfs {
+            port: nfs_mount_port(&mnt).context("could not determine the server port")?,
+        },
+    };
+    Ok(Root { path: mnt, backend })
 }
 
 /// Absolute mountpoint path without touching the mountpoint itself.
@@ -140,3 +236,28 @@ pub fn nfs_mount_port(mountpoint: &std::path::Path) -> Option<u16> {
         .and_then(|p| p.parse().ok())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_names() {
+        assert!(validate_store_name("default").is_ok());
+        assert!(validate_store_name("build-2").is_ok());
+        for bad in ["", "-x", "Upper", "a_b", "a.b", "a/b", &"x".repeat(65)] {
+            assert!(validate_store_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn roots_exclude_attachments() {
+        assert!(is_root("127.0.0.1:/"));
+        assert!(is_root("buildfs://default"));
+        assert!(!is_root("buildfs://att-web-node_modules-1a2b"));
+        assert!(!is_root("127.0.0.1:/.buildfs/attach/x"));
+        assert!(!is_root("/dev/disk3s1"));
+        assert_eq!(fskit_store("buildfs://x"), Some("x"));
+        assert_eq!(fskit_store("127.0.0.1:/"), None);
+    }
+}

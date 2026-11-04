@@ -223,7 +223,7 @@ const ENV_ONLY: &[(&str, &str, &str)] = &[
 ];
 
 pub fn run(tools: &[String], mount: Option<&Path>, revert: bool) -> anyhow::Result<()> {
-    let (root, _) = find_root_mount(mount)?;
+    let root = find_root_mount(mount)?.path;
     let all = integrations()?;
     let known: Vec<&str> = all.iter().map(|i| i.name).collect();
     let selected: Vec<&Integration> = if tools.iter().any(|t| t == "all") {

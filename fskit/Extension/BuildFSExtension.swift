@@ -208,6 +208,10 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
     private var items: [UInt64: Node] = [:]
     private var root: Node?
     private var groupCache: [UInt32: [UInt32]] = [:]
+    /// `-o trace`: log every lookup and xattr read with its result.
+    private var trace = false
+    /// `-o discard`: delete the store when the volume closes (`buildfs detach`).
+    private var discardOnClose = false
     private let slowQueue = DispatchQueue(label: "buildfs.slow", qos: .userInitiated, attributes: .concurrent)
 
     init(storeName: String) {
@@ -231,6 +235,10 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             this session compacted \(st.compacted) files (\(st.logical_bytes) -> \(st.stored_bytes) bytes, \
             \(st.dedup_chunks) chunks deduplicated)
             """)
+        if discardOnClose {
+            try? FileManager.default.removeItem(atPath: storeDir)
+            log.notice("discarded store \(self.storeName, privacy: .public)")
+        }
     }
 
     /// Allocated bytes under `dir` (what `du` reports). The store lives in
@@ -361,11 +369,11 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
         return s
     }
 
-    // Without these FSKit reports _PC_XATTR_SIZE_BITS / _PC_FILESIZEBITS
-    // as unsupported, and copyfile(3) (cp -p) then skips xattrs. Use the
-    // *InBits variants: FSKit's conversion from the byte variants is broken
-    // (maximumFileSize = 2^50 made every write fail with EFBIG;
-    // maximumXattrSize = 64 MiB showed up as 18 bits).
+    // FSKit's headers ask for one of each pair. Without them
+    // _PC_FILESIZEBITS reads 0 and _PC_XATTR_SIZE_BITS is ENOTSUP; xattrs
+    // and large files work either way. Use the *InBits variants: with
+    // maximumFileSize = 2^50 every write fails with EFBIG.
+    // _PC_XATTR_SIZE_BITS reads 18 whatever value is returned here.
     /// 64 MiB = 2^(27 - 1); matches BFS_MAX_XATTR_SIZE.
     var maximumXattrSizeInBits: Int { 27 }
     /// 2^50 bytes = 2^(51 - 1); matches BFS_MAX_FILE_SIZE.
@@ -386,7 +394,17 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             try? FileManager.default.removeItem(atPath: dir)
             log.notice("fresh: removed store \(dir, privacy: .public)")
         }
+        discardOnClose = mountOpts.contains("discard")
+        trace = mountOpts.contains("trace")
+        // Tuning from `buildfs mount --fskit --level ...`.
+        func value(_ key: String) -> Int? {
+            mountOpts.first { $0.hasPrefix(key + "=") }.flatMap { Int($0.dropFirst(key.count + 1)) }
+        }
         var opts = BfsOptions()
+        if let n = value("level") { opts.zstd_level = Int32(n) }
+        if let n = value("workers"), n > 0 { opts.compress_workers = UInt32(n) }
+        // Seconds without writes before compressing; 0 = never.
+        if let n = value("compress_after") { opts.compress_after_ms = n == 0 ? -1 : Int64(n) * 1000 }
         var h: OpaquePointer?
         let rc = dir.withCString { bfs_open($0, &opts, &h) }
         guard rc == 0, let h else {
@@ -447,6 +465,7 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             guard let h = v, let dir = directory as? Node else { return reply(nil, posix(.EIO)) }
             var a = BfsAttr()
             let rc = withName(name) { bfs_lookup(h, dir.ino, $0, $1, &a) }
+            if trace { log.notice("trace lookup \(name.string ?? "?", privacy: .public) rc=\(rc)") }
             guard rc == 0 else { return reply(nil, fsError(rc)) }
             let n = item(a, parent: dir.ino)
             reply(FSLookupItemResult(foundItem: n, itemName: name, itemAttributes: fsAttrs(a, parent: dir.ino)), nil)
@@ -674,6 +693,7 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             guard let h = v, let n = item as? Node else { return reply(nil, posix(.EIO)) }
             var b = BfsBuf()
             let rc = withName(name) { bfs_get_xattr(h, n.ino, $0, $1, &b) }
+            if trace { log.notice("trace getxattr \(name.string ?? "?", privacy: .public) of \(n.ino) rc=\(rc)") }
             guard rc == 0 else { return reply(nil, fsError(rc)) }
             reply(FSGetXattrResult(xattrValue: takeBuf(b)), nil)
         }
