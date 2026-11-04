@@ -12,12 +12,14 @@ use std::time::Duration;
 use embednfs::{AuthContext, FsError, RequestContext, SetAttrs, SetTime, XattrSetMode};
 use parking_lot::{Condvar, Mutex};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use crate::cold::{self, ColdStore};
+use crate::chunks::{self, ChunkStore, Hash};
 use crate::hot::HotStore;
 use crate::meta::*;
 use crate::wal::{self, Mutation, Wal};
+
+mod tier;
 
 pub type Result<T> = std::result::Result<T, FsError>;
 
@@ -178,6 +180,9 @@ struct W<'t> {
     xattrs: Table<'t, (u64, &'static str), &'static [u8]>,
     counters: Table<'t, &'static str, u64>,
     inline: Table<'t, u64, &'static [u8]>,
+    chunks: Table<'t, &'static [u8], (u64, u32, u8)>,
+    chunkdata: Table<'t, &'static [u8], &'static [u8]>,
+    chunkmap: Table<'t, (u64, u32), &'static [u8]>,
     change: &'t AtomicU64,
     open_counts: &'t Mutex<std::collections::HashMap<Ino, u32>>,
     /// Data files to delete once the transaction has committed.
@@ -232,7 +237,7 @@ impl W<'_> {
         match *data {
             Data::Empty => {}
             Data::Hot => self.drop_data.push(DropData::Hot(ino)),
-            Data::Cold { gen_, .. } => self.drop_data.push(DropData::Cold(ino, gen_)),
+            Data::Chunked { .. } => self.release_chunks(ino)?,
             Data::Inline { .. } => self.del_inline(ino)?,
         }
         Ok(())
@@ -337,7 +342,9 @@ impl W<'_> {
 
 enum DropData {
     Hot(Ino),
-    Cold(Ino, u64),
+    /// A chunk whose last reference went away; its file is deleted after
+    /// re-checking under `chunk_lock` (see `tier.rs`).
+    Chunk(Hash),
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +370,7 @@ pub struct Options {
     pub sync: SyncMode,
     /// Period of background durable commits; `None` disables them (tests).
     pub flush_interval: Option<Duration>,
-    /// zstd level for the cold tier.
+    /// zstd level for compressed data.
     pub level: i32,
     /// Compress files once they haven't been written for this long.
     /// `None` disables background compression.
@@ -423,12 +430,18 @@ pub struct CompressStats {
     pub aborted: u64,
     pub logical_bytes: u64,
     pub stored_bytes: u64,
+    /// Chunks (and their logical bytes) that were already stored.
+    pub dedup_chunks: u64,
+    pub dedup_bytes: u64,
 }
 
 pub struct Vfs {
     db: Database,
     hot: HotStore,
-    cold: ColdStore,
+    chunks: ChunkStore,
+    /// Serializes chunk-file deletion against new references to the same
+    /// chunk (see `tier.rs`).
+    chunk_lock: Mutex<()>,
     level: i32,
     compress_after: Option<Duration>,
     compactor: Mutex<CompactorState>,
@@ -475,7 +488,7 @@ impl Vfs {
         std::fs::create_dir_all(store)?;
         let db = Database::create(store.join("meta.redb"))?;
         let hot = HotStore::open(store.join("hot"))?;
-        let cold = ColdStore::open(store.join("cold"), options.level, options.cache_bytes)?;
+        let chunks = ChunkStore::open(store.join("chunks"), options.cache_bytes)?;
         let wal_dir = store.join("wal");
         let pending = wal::segments(&wal_dir)?;
         let seed = {
@@ -487,7 +500,8 @@ impl Vfs {
         let vfs = Arc::new(Self {
             db,
             hot,
-            cold,
+            chunks,
+            chunk_lock: Mutex::new(()),
             level: options.level,
             compress_after: options.compress_after,
             compactor: Mutex::new(CompactorState::default()),
@@ -544,11 +558,17 @@ impl Vfs {
             let _ = txn.open_table(DIRCOOKIES).db()?;
             let _ = txn.open_table(XATTRS).db()?;
             let _ = txn.open_table(INLINE).db()?;
+            let _ = txn.open_table(CHUNKS).db()?;
+            let _ = txn.open_table(CHUNKDATA).db()?;
+            let _ = txn.open_table(CHUNKMAP).db()?;
             let version = counters.get(FORMAT_VERSION_KEY).db()?.map(|v| v.value());
             match version {
                 Some(FORMAT_VERSION) => {}
                 Some(other) => {
-                    error!("unsupported store format version {other}");
+                    error!(
+                        "store format version {other} is not supported (expected {FORMAT_VERSION}); \
+                         use a new store directory"
+                    );
                     return Err(FsError::Io);
                 }
                 None => {
@@ -583,6 +603,9 @@ impl Vfs {
             let mut xattrs = txn.open_table(XATTRS)?;
             let mut counters = txn.open_table(COUNTERS)?;
             let mut inline = txn.open_table(INLINE)?;
+            let mut chunk_t = txn.open_table(CHUNKS)?;
+            let mut chunkdata = txn.open_table(CHUNKDATA)?;
+            let mut chunkmap = txn.open_table(CHUNKMAP)?;
             for (_, path) in segments {
                 for record in wal::read_segment(path)? {
                     for m in record {
@@ -619,6 +642,24 @@ impl Vfs {
                             }
                             Mutation::InlineDel(i) => {
                                 let _ = inline.remove(i)?;
+                            }
+                            Mutation::ChunkPut(h, rc, len, raw) => {
+                                let _ = chunk_t.insert(h.as_slice(), (rc, len, raw))?;
+                            }
+                            Mutation::ChunkDel(h) => {
+                                let _ = chunk_t.remove(h.as_slice())?;
+                            }
+                            Mutation::ChunkDataPut(h, v) => {
+                                let _ = chunkdata.insert(h.as_slice(), v.as_slice())?;
+                            }
+                            Mutation::ChunkDataDel(h) => {
+                                let _ = chunkdata.remove(h.as_slice())?;
+                            }
+                            Mutation::ChunkMapPut(i, idx, h) => {
+                                let _ = chunkmap.insert((i, idx), h.as_slice())?;
+                            }
+                            Mutation::ChunkMapDel(i, idx) => {
+                                let _ = chunkmap.remove((i, idx))?;
                             }
                         }
                     }
@@ -723,10 +764,10 @@ impl Vfs {
                 removed += 1;
             }
         }
-        for (ino, gen_) in self.cold.list().map_err(io_err)? {
-            let live = matches!(data_of(ino)?, Some(Data::Cold { gen_: g, .. }) if g == gen_);
-            if !live {
-                self.cold.remove(ino, gen_).map_err(io_err)?;
+        let chunk_t = txn.open_table(CHUNKS).db()?;
+        for h in self.chunks.list_files().map_err(io_err)? {
+            if chunk_t.get(h.as_slice()).db()?.is_none() {
+                self.chunks.remove_file(&h).map_err(io_err)?;
                 removed += 1;
             }
         }
@@ -843,6 +884,9 @@ impl Vfs {
                 xattrs: txn.open_table(XATTRS).db()?,
                 counters: txn.open_table(COUNTERS).db()?,
                 inline: txn.open_table(INLINE).db()?,
+                chunks: txn.open_table(CHUNKS).db()?,
+                chunkdata: txn.open_table(CHUNKDATA).db()?,
+                chunkmap: txn.open_table(CHUNKMAP).db()?,
                 change: &self.change,
                 open_counts: &self.open_counts,
                 drop_data: Vec::new(),
@@ -856,12 +900,13 @@ impl Vfs {
         txn.commit().db()?;
         self.dirty.store(true, Ordering::Release);
         for d in drop_data {
-            let (ino, r) = match d {
-                DropData::Hot(ino) => (ino, self.hot.remove(ino)),
-                DropData::Cold(ino, gen_) => (ino, self.cold.remove(ino, gen_)),
-            };
-            if let Err(e) = r {
-                warn!("failed to remove data for inode {ino}: {e}");
+            match d {
+                DropData::Hot(ino) => {
+                    if let Err(e) = self.hot.remove(ino) {
+                        warn!("failed to remove data for inode {ino}: {e}");
+                    }
+                }
+                DropData::Chunk(h) => self.delete_chunk_file_if_unused(&h),
             }
         }
         Ok(result)
@@ -881,7 +926,7 @@ impl Vfs {
         match inode.data {
             Data::Hot => self.hot.allocated(ino).unwrap_or(inode.size),
             Data::Empty => 0,
-            Data::Cold { disk, .. } => disk,
+            Data::Chunked { disk } => disk,
             Data::Inline { disk } => u64::from(disk),
         }
     }
@@ -991,7 +1036,7 @@ impl Vfs {
         match inode.data {
             Data::Hot => self.hot.read_at(ino, offset, len),
             Data::Empty => Ok(vec![0; len]),
-            Data::Cold { gen_, .. } => self.cold.read_at(ino, gen_, offset, len),
+            Data::Chunked { .. } => self.read_chunked(ino, inode.size, offset, len),
             Data::Inline { .. } => {
                 let stored = {
                     let txn = self.db.begin_read().map_err(std::io::Error::other)?;
@@ -1002,7 +1047,7 @@ impl Vfs {
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
                     v.value().to_vec()
                 };
-                let full = cold::decompress_inline(&stored, inode.size as usize)?;
+                let full = chunks::decode(stored, false, inode.size as usize)?;
                 let start = (offset as usize).min(full.len());
                 let end = (start + len).min(full.len());
                 let mut out = full[start..end].to_vec();
@@ -1233,7 +1278,7 @@ impl Vfs {
                 let mut inode = w.get(ino)?;
                 if let Some(size) = attrs.size
                     && size != inode.size
-                    && matches!(inode.data, Data::Cold { .. } | Data::Inline { .. })
+                    && matches!(inode.data, Data::Chunked { .. } | Data::Inline { .. })
                 {
                     if size != 0 {
                         return Ok(None); // needs the bytes back first
@@ -1286,7 +1331,7 @@ impl Vfs {
                     })?;
                     continue;
                 }
-                Data::Cold { .. } | Data::Inline { .. } => {
+                Data::Chunked { .. } | Data::Inline { .. } => {
                     self.rehydrate(ino)?;
                     continue;
                 }
@@ -1297,7 +1342,7 @@ impl Vfs {
                 let mut inode = w.get(ino)?;
                 if inode.data != Data::Hot {
                     // Compressed concurrently: our bytes may have missed the
-                    // cold image. Rehydrate and write again.
+                    // compressed copy. Rehydrate and write again.
                     return Ok(false);
                 }
                 if end > inode.size {
@@ -1317,266 +1362,6 @@ impl Vfs {
                 return Ok(data.len() as u32);
             }
         }
-    }
-
-    // ----- tiering ------------------------------------------------------------
-
-    /// Brings a cold/inline file back to the hot tier (for in-place writes).
-    fn rehydrate(&self, ino: Ino) -> Result<()> {
-        let _guard = self.rehydrate_lock.lock();
-        let inode = self.getattr(ino)?;
-        if !matches!(inode.data, Data::Cold { .. } | Data::Inline { .. }) {
-            return Ok(());
-        }
-        // Any hot file present now is a stray from a racing write.
-        self.hot.remove(ino).map_err(io_err)?;
-        self.hot.create(ino, 0).map_err(io_err)?;
-        let step = u64::from(cold::CHUNK_SIZE) * 8;
-        let mut off = 0;
-        while off < inode.size {
-            let len = (inode.size - off).min(step) as usize;
-            let bytes = self.read_data(ino, &inode, off, len).map_err(io_err)?;
-            self.hot.write_at(ino, off, &bytes).map_err(io_err)?;
-            off += len as u64;
-        }
-        self.hot.set_len(ino, inode.size).map_err(io_err)?;
-        let swapped = self.write(|w| {
-            let mut cur = w.get(ino)?;
-            if cur.data != inode.data {
-                return Ok(false);
-            }
-            let old = std::mem::replace(&mut cur.data, Data::Hot);
-            w.release_data(ino, &old)?;
-            w.put(ino, &cur)?;
-            Ok(true)
-        });
-        match swapped {
-            Ok(true) => {
-                self.stats.lock().rehydrated += 1;
-                let mut c = self.compactor.lock();
-                let b = c.backoff.entry(ino).or_insert(Duration::ZERO);
-                *b = (*b * 2).max(self.compress_after.unwrap_or_default()).min(MAX_COMPRESS_DELAY);
-                drop(c);
-                self.note_modified(ino);
-                Ok(())
-            }
-            other => {
-                // Truncated to zero or deleted meanwhile: our copy is junk.
-                let still_hot = self.getattr(ino).is_ok_and(|i| i.data == Data::Hot);
-                if !still_hot {
-                    let _ = self.hot.remove(ino);
-                }
-                other.map(|_| ())
-            }
-        }
-    }
-
-    /// Schedules `ino` for compression once it has been idle long enough.
-    fn note_modified(&self, ino: Ino) {
-        let Some(base) = self.compress_after else { return };
-        let mut c = self.compactor.lock();
-        let delay = c.backoff.get(&ino).copied().unwrap_or(base).max(base);
-        let _ = c.pending.insert(
-            ino,
-            Pending {
-                since: std::time::Instant::now(),
-                delay,
-            },
-        );
-    }
-
-    /// Hint (e.g. NFS CLOSE) that a file is probably complete. Currently only
-    /// keeps the idle timer authoritative; reserved for smarter policies.
-    pub fn note_closed(&self, _ino: Ino) {}
-
-    pub fn compress_stats(&self) -> CompressStats {
-        *self.stats.lock()
-    }
-
-    /// Compresses `ino` into the cold (or inline) tier if it is still hot
-    /// and unmodified since we looked at it. Returns whether it moved.
-    pub fn compact(&self, ino: Ino) -> Result<bool> {
-        let inode = match self.getattr(ino) {
-            Ok(i) => i,
-            Err(FsError::Stale) => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        if inode.kind != Kind::File || inode.data != Data::Hot {
-            return Ok(false);
-        }
-        let change0 = inode.change;
-        let size = inode.size;
-        let unchanged = |cur: &Inode| cur.change == change0 && cur.data == Data::Hot;
-
-        // Empty and tiny files go to redb: a separate file would occupy at
-        // least one 4 KiB block on the backing filesystem.
-        if size <= INLINE_PROBE_MAX {
-            let raw = self.hot.read_at(ino, 0, size as usize).map_err(io_err)?;
-            let packed = if size == 0 {
-                Vec::new()
-            } else {
-                cold::compress_inline(&raw, self.level).map_err(io_err)?
-            };
-            if packed.len() <= INLINE_MAX {
-                let moved = self.write(|w| {
-                    let mut cur = w.get(ino)?;
-                    if !unchanged(&cur) {
-                        return Ok(false);
-                    }
-                    if size == 0 {
-                        cur.data = Data::Empty;
-                    } else {
-                        w.put_inline(ino, &packed)?;
-                        cur.data = Data::Inline {
-                            disk: packed.len() as u32,
-                        };
-                    }
-                    w.drop_data.push(DropData::Hot(ino));
-                    w.put(ino, &cur)?;
-                    Ok(true)
-                })?;
-                self.record_compaction(moved, true, size, packed.len() as u64);
-                return Ok(moved);
-            }
-        }
-
-        let gen_ = self.change.fetch_add(1, Ordering::Relaxed);
-        let written = self
-            .cold
-            .write(ino, size, |off, len| self.hot.read_at(ino, off, len))
-            .map_err(io_err)?;
-        let disk = written.disk_bytes;
-        let mut published = false;
-        let result = self.write(|w| {
-            let mut cur = w.get(ino)?;
-            if !unchanged(&cur) {
-                return Ok(false);
-            }
-            // Published before commit so a committed Cold always has its file;
-            // a crash in between leaves an orphan that startup GC removes.
-            self.cold.publish(&written, ino, gen_).map_err(io_err)?;
-            published = true;
-            cur.data = Data::Cold { gen_, disk };
-            w.drop_data.push(DropData::Hot(ino));
-            w.put(ino, &cur)?;
-            Ok(true)
-        });
-        match result {
-            Ok(true) => {
-                self.record_compaction(true, false, size, disk);
-                Ok(true)
-            }
-            Ok(false) => {
-                self.cold.discard(written);
-                self.record_compaction(false, false, 0, 0);
-                Ok(false)
-            }
-            Err(e) => {
-                if published {
-                    let _ = self.cold.remove(ino, gen_);
-                } else {
-                    self.cold.discard(written);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    fn record_compaction(&self, moved: bool, inline: bool, logical: u64, stored: u64) {
-        let mut st = self.stats.lock();
-        if !moved {
-            st.aborted += 1;
-            return;
-        }
-        if inline {
-            st.inlined += 1;
-        } else {
-            st.compacted += 1;
-        }
-        st.logical_bytes += logical;
-        st.stored_bytes += stored;
-    }
-
-    /// Compresses every pending file now, ignoring idle timers (tests, CLI).
-    pub fn compact_all_pending(&self) -> Result<usize> {
-        let inos: Vec<Ino> = self.compactor.lock().pending.drain().map(|(k, _)| k).collect();
-        let mut moved = 0;
-        for ino in inos {
-            if self.compact(ino)? {
-                moved += 1;
-            }
-        }
-        Ok(moved)
-    }
-
-    fn spawn_compactor(vfs: &Arc<Self>, workers: usize) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Ino>(4096);
-        let rx = Arc::new(Mutex::new(rx));
-        let mut handles = Vec::new();
-        for i in 0..workers {
-            let weak = Arc::downgrade(vfs);
-            let rx = rx.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("buildfs-compress-{i}"))
-                .spawn(move || {
-                    lower_thread_priority();
-                    loop {
-                        let next = rx.lock().recv();
-                        let Ok(ino) = next else { return };
-                        let Some(vfs) = weak.upgrade() else { return };
-                        if let Err(e) = vfs.compact(ino) {
-                            debug!("compaction of inode {ino} failed: {e:?}");
-                        }
-                    }
-                });
-            match h {
-                Ok(h) => handles.push(h),
-                Err(e) => error!("failed to start compression worker: {e}"),
-            }
-        }
-        let weak = Arc::downgrade(vfs);
-        let scheduler = std::thread::Builder::new()
-            .name("buildfs-compress-sched".into())
-            .spawn(move || {
-                loop {
-                    let Some(vfs) = weak.upgrade() else { return };
-                    let due: Vec<Ino> = {
-                        let mut c = vfs.compactor.lock();
-                        if c.shutdown {
-                            return; // dropping `tx` stops the workers
-                        }
-                        let _ = vfs
-                            .compactor_cv
-                            .wait_for(&mut c, Duration::from_millis(500));
-                        if c.shutdown {
-                            return;
-                        }
-                        let now = std::time::Instant::now();
-                        let due: Vec<Ino> = c
-                            .pending
-                            .iter()
-                            .filter(|(_, p)| now.duration_since(p.since) >= p.delay)
-                            .map(|(k, _)| *k)
-                            .take(1024)
-                            .collect();
-                        for ino in &due {
-                            let _ = c.pending.remove(ino);
-                        }
-                        due
-                    };
-                    drop(vfs);
-                    for ino in due {
-                        if tx.send(ino).is_err() {
-                            return;
-                        }
-                    }
-                }
-            });
-        match scheduler {
-            Ok(h) => handles.push(h),
-            Err(e) => error!("failed to start compression scheduler: {e}"),
-        }
-        *vfs.compactor_threads.lock() = handles;
     }
 
     pub fn sync_mode(&self) -> SyncMode {
@@ -1733,7 +1518,7 @@ fn apply_setattr(
                 Data::Hot => hot.set_len(ino, size).map_err(io_err)?,
                 Data::Empty => {} // reads synthesize zeros up to `size`
                 // Callers rehydrate (or drop) compressed data before resizing.
-                Data::Cold { .. } | Data::Inline { .. } => return Err(FsError::Io),
+                Data::Chunked { .. } | Data::Inline { .. } => return Err(FsError::Io),
             }
             inode.size = size;
             data_changed = true;

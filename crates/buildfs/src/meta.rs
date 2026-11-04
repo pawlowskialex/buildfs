@@ -7,6 +7,9 @@
 //! - `xattrs`:      (ino, name) -> value
 //! - `counters`:    name -> u64                    (next inode / cookie)
 //! - `inline`:      ino -> zstd bytes              (tiny compressed files)
+//! - `chunks`:      hash -> (refcount, len, raw)   (content-addressed store)
+//! - `chunkdata`:   hash -> bytes                  (small chunks)
+//! - `chunkmap`:    (ino, idx) -> hash             (file -> chunks)
 //!
 //! Inode numbers and readdir cookies are allocated from monotonic counters and
 //! never reused, so NFS filehandles that embed an inode number can never
@@ -31,11 +34,17 @@ pub const XATTRS: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("xa
 pub const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
 /// ino -> zstd frame of the whole file, for files that compress tiny.
 pub const INLINE: TableDefinition<u64, &[u8]> = TableDefinition::new("inline");
+/// chunk hash -> (refcount, stored length, stored raw?)
+pub const CHUNKS: TableDefinition<&[u8], (u64, u32, u8)> = TableDefinition::new("chunks");
+/// chunk hash -> stored bytes, for chunks small enough to skip a file
+pub const CHUNKDATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunkdata");
+/// (ino, chunk index) -> chunk hash
+pub const CHUNKMAP: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("chunkmap");
 
 pub const NEXT_INO: &str = "next_ino";
 pub const NEXT_COOKIE: &str = "next_cookie";
 pub const FORMAT_VERSION_KEY: &str = "format_version";
-pub const FORMAT_VERSION: u64 = 1;
+pub const FORMAT_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -73,8 +82,9 @@ pub enum Data {
     Empty,
     /// Uncompressed file in the hot store, named after the inode.
     Hot,
-    /// Compressed image in the cold store (`cold/<ino>-<gen>`).
-    Cold { gen_: u64, disk: u64 },
+    /// Content-addressed compressed chunks listed in `chunkmap`. `disk` is
+    /// the stored size of its chunks (shared chunks are counted in full).
+    Chunked { disk: u64 },
     /// Compressed bytes in the `inline` table (`disk` = stored length).
     Inline { disk: u32 },
 }

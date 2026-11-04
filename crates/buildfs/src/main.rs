@@ -180,14 +180,20 @@ fn log_stats(vfs: &Vfs) {
     let st = vfs.compress_stats();
     if st.compacted + st.inlined > 0 {
         info!(
-            "compressed {} files ({} inline): {:.1} MiB -> {:.1} MiB ({:.2}x); {} rehydrated",
+            "compressed {} files ({} inline): {:.1} MiB -> {:.1} MiB ({:.2}x); \
+             {} chunks ({:.1} MiB) deduplicated; {} rehydrated",
             st.compacted + st.inlined,
             st.inlined,
             st.logical_bytes as f64 / 1048576.0,
             st.stored_bytes as f64 / 1048576.0,
             st.logical_bytes as f64 / st.stored_bytes.max(1) as f64,
+            st.dedup_chunks,
+            st.dedup_bytes as f64 / 1048576.0,
             st.rehydrated
         );
+    }
+    if let Ok((bytes, n)) = vfs.chunk_usage() {
+        info!("chunk store: {n} distinct chunks, {:.1} MiB", bytes as f64 / 1048576.0);
     }
 }
 

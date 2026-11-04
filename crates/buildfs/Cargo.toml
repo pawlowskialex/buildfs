@@ -8,6 +8,7 @@ description = "Transparently compressing NFSv4.1 userspace filesystem for build 
 
 [dependencies]
 anyhow = "1"
+blake3 = "1"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }

@@ -33,6 +33,12 @@ pub enum Mutation {
     Counter(String, u64),
     InlinePut(u64, Vec<u8>),
     InlineDel(u64),
+    ChunkPut(Vec<u8>, u64, u32, u8),
+    ChunkDel(Vec<u8>),
+    ChunkDataPut(Vec<u8>, Vec<u8>),
+    ChunkDataDel(Vec<u8>),
+    ChunkMapPut(u64, u32, Vec<u8>),
+    ChunkMapDel(u64, u32),
 }
 
 pub struct Wal {

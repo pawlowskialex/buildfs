@@ -437,7 +437,7 @@ fn read_all(vfs: &Vfs, ino: u64) -> Vec<u8> {
 }
 
 #[test]
-fn compacts_large_file_to_cold_and_reads_randomly() {
+fn compacts_large_file_to_chunks_and_reads_randomly() {
     use buildfs::meta::Data;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
@@ -449,7 +449,7 @@ fn compacts_large_file_to_cold_and_reads_randomly() {
     let before = vfs.getattr(f).unwrap();
     assert!(vfs.compact(f).unwrap());
     let after = vfs.getattr(f).unwrap();
-    assert!(matches!(after.data, Data::Cold { .. }));
+    assert!(matches!(after.data, Data::Chunked { .. }));
     // Compression must not look like a modification to NFS clients.
     assert_eq!(after.change, before.change);
     assert_eq!(after.mtime, before.mtime);
@@ -494,7 +494,7 @@ fn tiny_files_go_inline_and_empty_files_drop_data() {
 }
 
 #[test]
-fn writes_rehydrate_and_truncate_drops_cold_data() {
+fn writes_rehydrate_and_truncate_drops_chunks() {
     use buildfs::meta::Data;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
@@ -503,7 +503,7 @@ fn writes_rehydrate_and_truncate_drops_cold_data() {
     vfs.write_data(f, 0, &data).unwrap();
     assert!(vfs.compact(f).unwrap());
 
-    // In-place write into the middle of a cold file.
+    // In-place write into the middle of a compressed file.
     vfs.write_data(f, 200_000, b"PATCHED").unwrap();
     data[200_000..200_007].copy_from_slice(b"PATCHED");
     assert_eq!(vfs.getattr(f).unwrap().data, Data::Hot);
@@ -522,7 +522,7 @@ fn writes_rehydrate_and_truncate_drops_cold_data() {
 }
 
 #[test]
-fn unlink_frees_cold_and_inline_data() {
+fn unlink_frees_chunks_and_inline_data() {
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
     let big = mkfile(&vfs, ROOT_INO, "big");
@@ -532,12 +532,12 @@ fn unlink_frees_cold_and_inline_data() {
     assert!(vfs.compact(big).unwrap());
     assert!(vfs.compact(small).unwrap());
     let cold_files = || {
-        walk(&tmp.path().join("cold"))
+        walk(&tmp.path().join("chunks"))
             .into_iter()
             .filter(|p| !p.to_string_lossy().contains("/tmp/"))
             .count()
     };
-    assert_eq!(cold_files(), 1);
+    assert!(cold_files() >= 1);
     vfs.remove(ROOT_INO, "big").unwrap();
     vfs.remove(ROOT_INO, "small").unwrap();
     assert_eq!(cold_files(), 0);
@@ -557,7 +557,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
-fn cold_data_survives_crash_and_orphans_are_collected() {
+fn chunked_data_survives_crash_and_orphans_are_collected() {
     let live = tempfile::tempdir().unwrap();
     let crashed = tempfile::tempdir().unwrap();
     let opts = Options {
@@ -573,8 +573,10 @@ fn cold_data_survives_crash_and_orphans_are_collected() {
     vfs.write_data(g, 0, b"deps: x y z").unwrap();
     assert!(vfs.compact(g).unwrap());
     snapshot_store(live.path(), crashed.path());
-    // An orphaned cold image left by a crash mid-publish.
-    let orphan = crashed.path().join("cold/ff/00000000000000ff-1");
+    // An orphaned chunk file left by a crash before its first reference.
+    let orphan = crashed
+        .path()
+        .join("chunks/ab/abababababababababababababababababababababababababababababababab");
     std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
     std::fs::write(&orphan, b"junk").unwrap();
 
@@ -632,7 +634,7 @@ fn background_compactor_runs_after_idle_delay() {
         assert!(std::time::Instant::now() < deadline, "never compacted");
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert!(matches!(vfs.getattr(f).unwrap().data, Data::Cold { .. }));
+    assert!(matches!(vfs.getattr(f).unwrap().data, Data::Chunked { .. }));
     vfs.shutdown();
 }
 
@@ -688,4 +690,125 @@ fn orphans_are_freed_on_restart() {
     let vfs = Vfs::open(tmp.path()).unwrap();
     assert_eq!(vfs.getattr(f).err(), Some(FsError::Stale));
     assert!(walk(&tmp.path().join("hot")).is_empty());
+}
+
+// ----- dedup ----------------------------------------------------------------
+
+#[test]
+fn identical_files_share_chunks_and_free_with_last_reference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let data = artifact(1_000_000);
+    let mut inos = Vec::new();
+    for name in ["proj-a.rlib", "proj-b.rlib", "proj-c.rlib"] {
+        let f = mkfile(&vfs, ROOT_INO, name);
+        vfs.write_data(f, 0, &data).unwrap();
+        assert!(vfs.compact(f).unwrap());
+        inos.push(f);
+    }
+    let (bytes_after_3, chunks_after_3) = vfs.chunk_usage().unwrap();
+    let single = {
+        let t2 = tempfile::tempdir().unwrap();
+        let v2 = Vfs::open_with(t2.path(), manual_compaction()).unwrap();
+        let f = mkfile(&v2, ROOT_INO, "x");
+        v2.write_data(f, 0, &data).unwrap();
+        assert!(v2.compact(f).unwrap());
+        v2.chunk_usage().unwrap()
+    };
+    assert_eq!((bytes_after_3, chunks_after_3), single, "three copies cost one");
+    let st = vfs.compress_stats();
+    assert_eq!(st.dedup_chunks, 2 * chunks_after_3);
+    for &f in &inos {
+        assert_eq!(read_all(&vfs, f), data);
+    }
+    // Shared chunks survive until the last file goes.
+    vfs.remove(ROOT_INO, "proj-a.rlib").unwrap();
+    vfs.remove(ROOT_INO, "proj-b.rlib").unwrap();
+    assert_eq!(read_all(&vfs, inos[2]), data);
+    assert_eq!(vfs.chunk_usage().unwrap(), single);
+    vfs.remove(ROOT_INO, "proj-c.rlib").unwrap();
+    assert_eq!(vfs.chunk_usage().unwrap(), (0, 0));
+    assert!(walk(&tmp.path().join("chunks"))
+        .iter()
+        .all(|p| p.to_string_lossy().contains("/tmp/")));
+}
+
+#[test]
+fn partially_shared_and_self_duplicate_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let block = artifact(128 * 1024);
+    // File with the same chunk four times, plus a distinct tail.
+    let mut a = block.repeat(4);
+    a.extend_from_slice(b"tail of a");
+    let mut b = block.clone();
+    b.extend_from_slice(&artifact(300_000)[1000..]);
+    let fa = mkfile(&vfs, ROOT_INO, "a");
+    let fb = mkfile(&vfs, ROOT_INO, "b");
+    vfs.write_data(fa, 0, &a).unwrap();
+    vfs.write_data(fb, 0, &b).unwrap();
+    assert!(vfs.compact(fa).unwrap());
+    assert!(vfs.compact(fb).unwrap());
+    assert_eq!(read_all(&vfs, fa), a);
+    assert_eq!(read_all(&vfs, fb), b);
+    // Rewriting `a` in place rehydrates it and drops its references only.
+    vfs.write_data(fa, 0, b"X").unwrap();
+    assert_eq!(read_all(&vfs, fb), b);
+    vfs.remove(ROOT_INO, "a").unwrap();
+    vfs.remove(ROOT_INO, "b").unwrap();
+    assert_eq!(vfs.chunk_usage().unwrap(), (0, 0));
+}
+
+#[test]
+fn shared_chunks_survive_crash_recovery() {
+    let live = tempfile::tempdir().unwrap();
+    let crashed = tempfile::tempdir().unwrap();
+    let opts = Options {
+        flush_interval: None,
+        ..manual_compaction()
+    };
+    let vfs = Vfs::open_with(live.path(), opts.clone()).unwrap();
+    let data = artifact(700_000);
+    let f = mkfile(&vfs, ROOT_INO, "one");
+    let g = mkfile(&vfs, ROOT_INO, "two");
+    vfs.write_data(f, 0, &data).unwrap();
+    vfs.write_data(g, 0, &data).unwrap();
+    assert!(vfs.compact(f).unwrap());
+    assert!(vfs.compact(g).unwrap());
+    vfs.remove(ROOT_INO, "one").unwrap();
+    snapshot_store(live.path(), crashed.path());
+    let rec = Vfs::open_with(crashed.path(), opts).unwrap();
+    assert_eq!(read_all(&rec, g), data);
+    rec.remove(ROOT_INO, "two").unwrap();
+    assert_eq!(rec.chunk_usage().unwrap(), (0, 0));
+    vfs.shutdown();
+}
+
+#[test]
+fn concurrent_dedup_and_deletion_never_lose_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let data = artifact(600_000);
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let v = &vfs;
+            let data = &data;
+            s.spawn(move || {
+                for i in 0..15 {
+                    let name = format!("t{t}-{i}");
+                    let f = mkfile(v, ROOT_INO, &name);
+                    v.write_data(f, 0, data).unwrap();
+                    let _ = v.compact(f).unwrap();
+                    assert_eq!(&read_all(v, f), data, "{name}");
+                    if i % 2 == 0 {
+                        v.remove(ROOT_INO, &name).unwrap();
+                    }
+                }
+            });
+        }
+    });
+    for name in names(&vfs, ROOT_INO) {
+        let f = vfs.lookup(ROOT_INO, &name).unwrap();
+        assert_eq!(read_all(&vfs, f), data, "{name}");
+    }
 }
