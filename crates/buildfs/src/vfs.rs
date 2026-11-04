@@ -16,6 +16,7 @@ use tracing::{error, warn};
 
 use crate::hot::HotStore;
 use crate::meta::*;
+use crate::wal::{self, Mutation, Wal};
 
 pub type Result<T> = std::result::Result<T, FsError>;
 
@@ -178,6 +179,9 @@ struct W<'t> {
     change: &'t AtomicU64,
     /// Inodes whose hot data must be deleted once the transaction commits.
     drop_data: Vec<Ino>,
+    /// Redo record for the WAL; every table write goes through a helper
+    /// below so nothing is missed.
+    log: Vec<Mutation>,
 }
 
 impl W<'_> {
@@ -187,8 +191,32 @@ impl W<'_> {
     }
 
     fn put(&mut self, ino: Ino, inode: &Inode) -> Result<()> {
-        let _ = self.inodes.insert(ino, inode.encode().as_slice()).db()?;
+        let bytes = inode.encode();
+        let _ = self.inodes.insert(ino, bytes.as_slice()).db()?;
+        self.log.push(Mutation::InodePut(ino, bytes));
         Ok(())
+    }
+
+    fn del_inode(&mut self, ino: Ino) -> Result<()> {
+        let _ = self.inodes.remove(ino).db()?;
+        self.log.push(Mutation::InodeDel(ino));
+        Ok(())
+    }
+
+    fn put_xattr(&mut self, ino: Ino, name: &str, value: &[u8]) -> Result<()> {
+        let _ = self.xattrs.insert((ino, name), value).db()?;
+        self.log
+            .push(Mutation::XattrPut(ino, name.to_owned(), value.to_vec()));
+        Ok(())
+    }
+
+    /// Returns whether the xattr existed.
+    fn del_xattr(&mut self, ino: Ino, name: &str) -> Result<bool> {
+        let existed = self.xattrs.remove((ino, name)).db()?.is_some();
+        if existed {
+            self.log.push(Mutation::XattrDel(ino, name.to_owned()));
+        }
+        Ok(existed)
     }
 
     fn next_change(&self) -> u64 {
@@ -198,6 +226,7 @@ impl W<'_> {
     fn alloc(&mut self, key: &str, first: u64) -> Result<u64> {
         let next = self.counters.get(key).db()?.map_or(first, |v| v.value());
         let _ = self.counters.insert(key, next + 1).db()?;
+        self.log.push(Mutation::Counter(key.to_owned(), next + 1));
         Ok(next)
     }
 
@@ -209,12 +238,18 @@ impl W<'_> {
         let cookie = self.alloc(NEXT_COOKIE, FIRST_COOKIE)?;
         let _ = self.dirents.insert((dir, name), (child, cookie)).db()?;
         let _ = self.cookies.insert((dir, cookie), name).db()?;
+        self.log
+            .push(Mutation::DirentPut(dir, name.to_owned(), child, cookie));
+        self.log
+            .push(Mutation::CookiePut(dir, cookie, name.to_owned()));
         Ok(())
     }
 
     fn unlink_entry(&mut self, dir: Ino, name: &str, cookie: u64) -> Result<()> {
         let _ = self.dirents.remove((dir, name)).db()?;
         let _ = self.cookies.remove((dir, cookie)).db()?;
+        self.log.push(Mutation::DirentDel(dir, name.to_owned()));
+        self.log.push(Mutation::CookieDel(dir, cookie));
         Ok(())
     }
 
@@ -242,7 +277,7 @@ impl W<'_> {
             self.touch_ctime(&mut inode);
             return self.put(ino, &inode);
         }
-        let _ = self.inodes.remove(ino).db()?;
+        self.del_inode(ino)?;
         if inode.xattr_count > 0 {
             let names: Vec<String> = self
                 .xattrs
@@ -252,7 +287,7 @@ impl W<'_> {
                 .collect::<std::result::Result<_, _>>()
                 .db()?;
             for name in names {
-                let _ = self.xattrs.remove((ino, name.as_str())).db()?;
+                let _ = self.del_xattr(ino, &name)?;
             }
         }
         if inode.data == Data::Hot {
@@ -266,9 +301,54 @@ impl W<'_> {
 // The filesystem
 // ---------------------------------------------------------------------------
 
+/// How much an NFS COMMIT (fsync/close) guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// Data and metadata reach the kernel page cache (pwrite + WAL append)
+    /// before replying, so they survive a crash of buildfs itself. Durable
+    /// redb commits happen in the background every second. Suits build
+    /// artifacts, and lets writes reply FILE_SYNC so clients skip COMMIT.
+    #[default]
+    Relaxed,
+    /// COMMIT fsyncs the file and waits for a durable metadata commit:
+    /// survives power loss at the cost of ~10 ms per closed file.
+    Strict,
+}
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub sync: SyncMode,
+    /// Period of background durable commits; `None` disables them (tests).
+    pub flush_interval: Option<Duration>,
+    /// Extended attributes that are accepted but never stored. See
+    /// [`DEFAULT_DROPPED_XATTRS`].
+    pub dropped_xattrs: Vec<String>,
+}
+
+/// `com.apple.provenance` is attached by the kernel to every file created by
+/// a provenance-tracked process (i.e. anything started from a terminal) and
+/// re-read on link/open/exec. Over NFS named attributes each check costs
+/// several round trips plus client-side stalls (~4 ms per hard link). Build
+/// artifacts don't need it, and filesystems without xattr support (FAT,
+/// exFAT) already behave this way.
+pub const DEFAULT_DROPPED_XATTRS: &[&str] = &["com.apple.provenance"];
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            sync: SyncMode::default(),
+            flush_interval: Some(Duration::from_secs(1)),
+            dropped_xattrs: DEFAULT_DROPPED_XATTRS.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+}
+
 pub struct Vfs {
     db: Database,
     hot: HotStore,
+    wal: Mutex<Wal>,
+    sync_mode: SyncMode,
+    dropped_xattrs: Vec<String>,
     change: AtomicU64,
     dirty: AtomicBool,
     flusher: Flusher,
@@ -296,9 +376,16 @@ pub struct DirItem {
 
 impl Vfs {
     pub fn open(store: &Path) -> anyhow::Result<Arc<Self>> {
+        Self::open_with(store, Options::default())
+    }
+
+    pub fn open_with(store: &Path, options: Options) -> anyhow::Result<Arc<Self>> {
+        let sync_mode = options.sync;
         std::fs::create_dir_all(store)?;
         let db = Database::create(store.join("meta.redb"))?;
         let hot = HotStore::open(store.join("hot"))?;
+        let wal_dir = store.join("wal");
+        let pending = wal::segments(&wal_dir)?;
         let seed = {
             let d = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -308,14 +395,19 @@ impl Vfs {
         let vfs = Arc::new(Self {
             db,
             hot,
+            // Placeholder segment numbering is fixed up after replay below.
+            wal: Mutex::new(Wal::open(&wal_dir)?),
+            sync_mode,
+            dropped_xattrs: options.dropped_xattrs.clone(),
             change: AtomicU64::new(seed),
             dirty: AtomicBool::new(false),
             flusher: Flusher::new(),
             flusher_thread: Mutex::new(None),
         });
         vfs.init_schema().map_err(|e| anyhow::anyhow!("init failed: {e:?}"))?;
+        vfs.replay_wal(&pending)?;
         vfs.gc_hot().map_err(|e| anyhow::anyhow!("gc failed: {e:?}"))?;
-        Self::spawn_flusher(&vfs);
+        Self::spawn_flusher(&vfs, options.flush_interval);
         Ok(vfs)
     }
 
@@ -370,6 +462,68 @@ impl Vfs {
         Ok(())
     }
 
+    /// Re-applies metadata changes that were in the WAL but not yet durable
+    /// in redb when the previous process died.
+    fn replay_wal(&self, segments: &[(u64, std::path::PathBuf)]) -> anyhow::Result<()> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let mut applied = 0usize;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut inodes = txn.open_table(INODES)?;
+            let mut dirents = txn.open_table(DIRENTS)?;
+            let mut cookies = txn.open_table(DIRCOOKIES)?;
+            let mut xattrs = txn.open_table(XATTRS)?;
+            let mut counters = txn.open_table(COUNTERS)?;
+            for (_, path) in segments {
+                for record in wal::read_segment(path)? {
+                    for m in record {
+                        match m {
+                            Mutation::InodePut(k, v) => {
+                                let _ = inodes.insert(k, v.as_slice())?;
+                            }
+                            Mutation::InodeDel(k) => {
+                                let _ = inodes.remove(k)?;
+                            }
+                            Mutation::DirentPut(d, n, c, ck) => {
+                                let _ = dirents.insert((d, n.as_str()), (c, ck))?;
+                            }
+                            Mutation::DirentDel(d, n) => {
+                                let _ = dirents.remove((d, n.as_str()))?;
+                            }
+                            Mutation::CookiePut(d, ck, n) => {
+                                let _ = cookies.insert((d, ck), n.as_str())?;
+                            }
+                            Mutation::CookieDel(d, ck) => {
+                                let _ = cookies.remove((d, ck))?;
+                            }
+                            Mutation::XattrPut(i, n, v) => {
+                                let _ = xattrs.insert((i, n.as_str()), v.as_slice())?;
+                            }
+                            Mutation::XattrDel(i, n) => {
+                                let _ = xattrs.remove((i, n.as_str()))?;
+                            }
+                            Mutation::Counter(k, v) => {
+                                let _ = counters.insert(k.as_str(), v)?;
+                            }
+                        }
+                    }
+                    applied += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        for (_, path) in segments {
+            std::fs::remove_file(path)?;
+        }
+        if applied > 0 {
+            warn!("recovered {applied} metadata transactions from the WAL");
+        }
+        Ok(())
+    }
+
     /// Deletes hot files whose inode no longer references them (crash leftovers).
     fn gc_hot(&self) -> Result<()> {
         let candidates = self.hot.list().map_err(io_err)?;
@@ -395,7 +549,7 @@ impl Vfs {
         Ok(())
     }
 
-    fn spawn_flusher(vfs: &Arc<Self>) {
+    fn spawn_flusher(vfs: &Arc<Self>, interval: Option<Duration>) {
         let weak = Arc::downgrade(vfs);
         let handle = std::thread::Builder::new()
             .name("buildfs-flush".into())
@@ -405,7 +559,12 @@ impl Vfs {
                     let target = {
                         let mut s = vfs.flusher.state.lock();
                         if s.requested == s.completed && !s.shutdown {
-                            let _ = vfs.flusher.cv.wait_for(&mut s, Duration::from_secs(1));
+                            match interval {
+                                Some(i) => {
+                                    let _ = vfs.flusher.cv.wait_for(&mut s, i);
+                                }
+                                None => vfs.flusher.cv.wait(&mut s),
+                            }
                         }
                         if s.shutdown {
                             return;
@@ -432,7 +591,14 @@ impl Vfs {
     fn durable_commit(&self) -> Result<()> {
         let mut txn = self.db.begin_write().db()?;
         txn.set_durability(Durability::Immediate).db()?;
-        txn.commit().db()
+        // Holding the write transaction excludes appends, so the old segment
+        // contains exactly the transactions this commit makes durable.
+        let old = self.wal.lock().rotate().map_err(io_err)?;
+        txn.commit().db()?;
+        if let Err(e) = std::fs::remove_file(&old) {
+            warn!("failed to remove WAL segment {}: {e}", old.display());
+        }
+        Ok(())
     }
 
     /// Makes every metadata change so far durable (group-committed).
@@ -467,8 +633,11 @@ impl Vfs {
                 counters: txn.open_table(COUNTERS).db()?,
                 change: &self.change,
                 drop_data: Vec::new(),
+                log: Vec::new(),
             };
             let r = f(&mut w)?; // early return aborts the transaction
+            // Appended while holding the write lock, so WAL order == commit order.
+            self.wal.lock().append(&w.log).map_err(io_err)?;
             (r, std::mem::take(&mut w.drop_data))
         };
         txn.commit().db()?;
@@ -858,8 +1027,16 @@ impl Vfs {
         Ok(data.len() as u32)
     }
 
-    /// NFS COMMIT / fsync: data and metadata of `ino` become durable.
+    pub fn sync_mode(&self) -> SyncMode {
+        self.sync_mode
+    }
+
+    /// NFS COMMIT / fsync. In relaxed mode everything acknowledged is
+    /// already in the page cache + WAL, so there is nothing to wait for.
     pub fn commit(&self, ino: Ino) -> Result<()> {
+        if self.sync_mode == SyncMode::Relaxed {
+            return Ok(());
+        }
         self.hot.sync(ino).map_err(io_err)?;
         self.sync_metadata();
         Ok(())
@@ -890,6 +1067,10 @@ impl Vfs {
         if name.is_empty() || name.len() > MAX_NAME_BYTES {
             return Err(FsError::InvalidInput);
         }
+        if self.dropped_xattrs.iter().any(|d| d == name) {
+            let _ = self.getattr(ino)?;
+            return Ok(());
+        }
         self.write(|w| {
             let mut inode = w.get(ino)?;
             let exists = w.xattrs.get((ino, name)).db()?.is_some();
@@ -898,7 +1079,7 @@ impl Vfs {
                 (XattrSetMode::ReplaceOnly, false) => return Err(FsError::NotFound),
                 _ => {}
             }
-            let _ = w.xattrs.insert((ino, name), value).db()?;
+            w.put_xattr(ino, name, value)?;
             if !exists {
                 inode.xattr_count += 1;
             }
@@ -910,7 +1091,7 @@ impl Vfs {
     pub fn remove_xattr(&self, ino: Ino, name: &str) -> Result<()> {
         self.write(|w| {
             let mut inode = w.get(ino)?;
-            if w.xattrs.remove((ino, name)).db()?.is_none() {
+            if !w.del_xattr(ino, name)? {
                 return Err(FsError::NotFound);
             }
             inode.xattr_count = inode.xattr_count.saturating_sub(1);

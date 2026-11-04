@@ -2,13 +2,30 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use embednfs::NfsServer;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use buildfs::nfs::BuildFs;
-use buildfs::vfs::Vfs;
+use buildfs::vfs::{Options, SyncMode, Vfs};
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Sync {
+    /// Survive buildfs crashes; no fsync on close (default, fast).
+    Relaxed,
+    /// fsync on close/fsync; survive power loss (slow).
+    Strict,
+}
+
+impl From<Sync> for SyncMode {
+    fn from(s: Sync) -> Self {
+        match s {
+            Sync::Relaxed => SyncMode::Relaxed,
+            Sync::Strict => SyncMode::Strict,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(version, about = "Compressing NFSv4.1 filesystem for build artifacts")]
@@ -26,6 +43,8 @@ enum Cmd {
         store: PathBuf,
         #[arg(long, default_value = "127.0.0.1:20490")]
         listen: String,
+        #[arg(long, value_enum, default_value = "relaxed")]
+        sync: Sync,
     },
     /// Serve a store and mount it; unmounts on Ctrl-C / SIGTERM.
     Mount {
@@ -37,6 +56,8 @@ enum Cmd {
         /// Extra mount_nfs options, appended to the defaults.
         #[arg(long, short = 'o')]
         options: Option<String>,
+        #[arg(long, value_enum, default_value = "relaxed")]
+        sync: Sync,
     },
 }
 
@@ -50,8 +71,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().cmd {
-        Cmd::Serve { store, listen } => {
-            let vfs = Vfs::open(&store)?;
+        Cmd::Serve {
+            store,
+            listen,
+            sync,
+        } => {
+            let vfs = Vfs::open_with(
+                &store,
+                Options {
+                    sync: sync.into(),
+                    ..Options::default()
+                },
+            )?;
             let listener = TcpListener::bind(&listen).await?;
             info!("serving {} on {listen}", store.display());
             let server = NfsServer::builder(BuildFs::new(vfs.clone()))
@@ -68,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             mountpoint,
             port,
             options,
+            sync,
         } => {
             let store = std::fs::canonicalize(&store)
                 .or_else(|_| {
@@ -79,14 +111,21 @@ async fn main() -> anyhow::Result<()> {
             if store.starts_with(&mountpoint) {
                 bail!("store must not live inside the mountpoint");
             }
-            let vfs = Vfs::open(&store)?;
+            let vfs = Vfs::open_with(
+                &store,
+                Options {
+                    sync: sync.into(),
+                    ..Options::default()
+                },
+            )?;
             let listener = TcpListener::bind(("127.0.0.1", port)).await?;
             let server = NfsServer::builder(BuildFs::new(vfs.clone()))
                 .server_identity(Vfs::server_identity(&store)?)
                 .build();
             let serve = tokio::spawn(server.serve(listener));
 
-            let mut opts = format!("vers=4.1,tcp,port={port},nobrowse,namedattr");
+            let mut opts =
+                format!("vers=4.1,tcp,port={port},nobrowse,namedattr,rsize=1048576,wsize=1048576");
             if let Some(extra) = options {
                 opts.push(',');
                 opts.push_str(&extra);

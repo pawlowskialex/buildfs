@@ -271,6 +271,8 @@ impl<F: FileSystem> NfsServer<F> {
             _ => None,
         };
 
+        let started = std::time::Instant::now();
+        let tag = args.tag.clone();
         let result = self
             .handle_compound(
                 args,
@@ -280,6 +282,13 @@ impl<F: FileSystem> NfsServer<F> {
                 session_limits,
             )
             .await;
+        tracing::trace!(
+            target: "embednfs::timing",
+            "compound {:?} took {:?} status={:?}",
+            tag.trim_end(),
+            started.elapsed(),
+            result.status
+        );
         encode_rpc_reply_accepted(response, call.xid);
         let body_start = response.len();
         result.encode(response);

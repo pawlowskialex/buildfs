@@ -1,5 +1,5 @@
 use buildfs::meta::{Kind, ROOT_INO};
-use buildfs::vfs::{Caller, NewNode, Vfs};
+use buildfs::vfs::{Caller, NewNode, Options, Vfs};
 use embednfs::{FsError, SetAttrs, XattrSetMode};
 
 fn user() -> Caller {
@@ -344,4 +344,84 @@ fn commit_is_durable() {
     let f = mkfile(&vfs, ROOT_INO, "f");
     vfs.write_data(f, 0, b"data").unwrap();
     vfs.commit(f).unwrap();
+}
+
+/// Copies the on-disk state of a live store, which is what a crash of the
+/// buildfs process would leave behind (no Drop, no final durable commit).
+fn snapshot_store(from: &std::path::Path, to: &std::path::Path) {
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dst = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &dst);
+            } else {
+                std::fs::copy(e.path(), dst).unwrap();
+            }
+        }
+    }
+    copy_dir(from, to);
+}
+
+#[test]
+fn wal_recovers_metadata_after_process_crash() {
+    let live = tempfile::tempdir().unwrap();
+    let crashed = tempfile::tempdir().unwrap();
+    let opts = Options {
+        flush_interval: None, // no background durable commits
+        ..Options::default()
+    };
+    let vfs = Vfs::open_with(live.path(), opts.clone()).unwrap();
+    let d = mkdir(&vfs, ROOT_INO, "target");
+    let f = mkfile(&vfs, d, "lib.rlib");
+    vfs.write_data(f, 0, b"artifact").unwrap();
+    vfs.link(f, ROOT_INO, "lib.rlib").unwrap();
+    vfs.set_xattr(f, "user.x", b"1", XattrSetMode::CreateOrReplace)
+        .unwrap();
+    let gone = mkfile(&vfs, d, "tmp");
+    vfs.remove(d, "tmp").unwrap();
+    vfs.rename(d, "lib.rlib", d, "renamed.rlib").unwrap();
+
+    snapshot_store(live.path(), crashed.path());
+
+    let rec = Vfs::open_with(crashed.path(), opts).unwrap();
+    let d2 = rec.lookup(ROOT_INO, "target").unwrap();
+    assert_eq!(d2, d);
+    assert_eq!(rec.lookup(d, "renamed.rlib").unwrap(), f);
+    assert_eq!(rec.lookup(d, "lib.rlib").err(), Some(FsError::NotFound));
+    assert_eq!(rec.getattr(f).unwrap().nlink, 2);
+    assert_eq!(rec.read(f, 0, 100).unwrap().0, b"artifact".to_vec());
+    assert_eq!(rec.get_xattr(f, "user.x").unwrap(), b"1");
+    assert_eq!(rec.getattr(gone).err(), Some(FsError::Stale));
+    // Counters were recovered too: no inode number reuse.
+    assert!(mkfile(&rec, ROOT_INO, "next") > gone);
+    // Replayed segments are gone; a clean reopen has nothing to replay.
+    rec.shutdown();
+    drop(rec);
+    let again = Vfs::open_with(crashed.path(), Options::default()).unwrap();
+    assert_eq!(again.lookup(d, "renamed.rlib").unwrap(), f);
+    vfs.shutdown();
+}
+
+#[test]
+fn provenance_xattr_is_dropped_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open(tmp.path()).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "f");
+    vfs.set_xattr(f, "com.apple.provenance", b"\x01", XattrSetMode::CreateOrReplace)
+        .unwrap();
+    assert_eq!(vfs.get_xattr(f, "com.apple.provenance").err(), Some(FsError::NotFound));
+    assert_eq!(vfs.getattr(f).unwrap().xattr_count, 0);
+
+    let keep = tempfile::tempdir().unwrap();
+    let opts = Options {
+        dropped_xattrs: vec![],
+        ..Options::default()
+    };
+    let vfs = Vfs::open_with(keep.path(), opts).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "f");
+    vfs.set_xattr(f, "com.apple.provenance", b"\x01", XattrSetMode::CreateOrReplace)
+        .unwrap();
+    assert_eq!(vfs.get_xattr(f, "com.apple.provenance").unwrap(), b"\x01");
 }

@@ -15,7 +15,7 @@ use embednfs::{
 };
 
 use crate::meta::{FLAG_ARCHIVE, FLAG_HIDDEN, FLAG_SYSTEM, Ino, Inode, Kind, ROOT_INO, Ts};
-use crate::vfs::{Caller, MAX_FILE_SIZE, NewNode, Vfs};
+use crate::vfs::{Caller, MAX_FILE_SIZE, NewNode, SyncMode, Vfs};
 
 #[derive(Clone)]
 pub struct BuildFs {
@@ -36,6 +36,15 @@ impl BuildFs {
         tokio::task::spawn_blocking(move || f(&vfs))
             .await
             .map_err(|_| FsError::ServerFault)?
+    }
+
+    /// Runs a cheap read-only operation directly on the async worker.
+    ///
+    /// redb reads are MVCC snapshots that never wait for writers and the
+    /// hot data is page-cached, so these finish in microseconds; skipping
+    /// the blocking-pool handoff roughly halves metadata round-trip latency.
+    fn inline<T>(&self, f: impl FnOnce(&Vfs) -> FsResult<T>) -> FsResult<T> {
+        f(&self.vfs)
     }
 
     fn attrs(vfs: &Vfs, ino: Ino, inode: &Inode) -> Attrs {
@@ -104,7 +113,7 @@ impl FileSystem for BuildFs {
     }
 
     async fn statfs(&self, _ctx: &RequestContext) -> FsResult<FsStats> {
-        self.run(|vfs| {
+        self.inline(|vfs| {
             let st = vfs.statfs()?;
             let frsize = st.f_frsize as u64;
             Ok(FsStats {
@@ -116,13 +125,11 @@ impl FileSystem for BuildFs {
                 avail_files: 1 << 39,
             })
         })
-        .await
     }
 
     async fn getattr(&self, _ctx: &RequestContext, h: &Ino) -> FsResult<Attrs> {
         let ino = *h;
-        self.run(move |vfs| Ok(Self::attrs(vfs, ino, &vfs.getattr(ino)?)))
-            .await
+        self.inline(|vfs| Ok(Self::attrs(vfs, ino, &vfs.getattr(ino)?)))
     }
 
     async fn access(
@@ -131,24 +138,20 @@ impl FileSystem for BuildFs {
         h: &Ino,
         requested: AccessMask,
     ) -> FsResult<AccessMask> {
-        let (ino, caller) = (*h, Caller::from_ctx(ctx));
-        self.run(move |vfs| vfs.access(&caller, ino, requested.bits()).map(AccessMask))
-            .await
+        let caller = Caller::from_ctx(ctx);
+        self.inline(|vfs| vfs.access(&caller, *h, requested.bits()).map(AccessMask))
     }
 
     async fn lookup(&self, _ctx: &RequestContext, parent: &Ino, name: &str) -> FsResult<Ino> {
-        let (parent, name) = (*parent, name.to_owned());
-        self.run(move |vfs| {
-            let r = vfs.lookup(parent, &name);
-            tracing::debug!(target: "buildfs::ops", "lookup {parent}/{name} -> {r:?}");
+        self.inline(|vfs| {
+            let r = vfs.lookup(*parent, name);
+            tracing::trace!(target: "buildfs::ops", "lookup {parent}/{name} -> {r:?}");
             r
         })
-        .await
     }
 
     async fn parent(&self, _ctx: &RequestContext, dir: &Ino) -> FsResult<Option<Ino>> {
-        let dir = *dir;
-        self.run(move |vfs| vfs.parent(dir)).await
+        self.inline(|vfs| vfs.parent(*dir))
     }
 
     async fn readdir(
@@ -160,7 +163,7 @@ impl FileSystem for BuildFs {
         with_attrs: bool,
     ) -> FsResult<DirPage<Ino>> {
         let dir = *dir;
-        self.run(move |vfs| {
+        self.inline(|vfs| {
             let (items, eof) = vfs.readdir(dir, cookie, max_entries as usize, with_attrs)?;
             let entries = items
                 .into_iter()
@@ -173,7 +176,6 @@ impl FileSystem for BuildFs {
                 .collect();
             Ok(DirPage { entries, eof })
         })
-        .await
     }
 
     async fn read(
@@ -205,9 +207,12 @@ impl FileSystem for BuildFs {
         let ino = *h;
         self.run(move |vfs| {
             let written = vfs.write_data(ino, offset, &data)?;
-            let stability = match requested {
-                WriteStability::Unstable => WriteStability::Unstable,
-                WriteStability::DataSync | WriteStability::FileSync => {
+            let stability = match (vfs.sync_mode(), requested) {
+                // Acknowledged writes are as durable as relaxed mode gets, so
+                // say so: the client then skips COMMIT on close entirely.
+                (SyncMode::Relaxed, _) => WriteStability::FileSync,
+                (SyncMode::Strict, WriteStability::Unstable) => WriteStability::Unstable,
+                (SyncMode::Strict, _) => {
                     vfs.commit(ino)?;
                     WriteStability::FileSync
                 }
@@ -320,14 +325,11 @@ impl StableHandles<Ino> for BuildFs {
 #[async_trait]
 impl Xattrs<Ino> for BuildFs {
     async fn list_xattrs(&self, _ctx: &RequestContext, h: &Ino) -> FsResult<Vec<String>> {
-        let ino = *h;
-        self.run(move |vfs| vfs.list_xattrs(ino)).await
+        self.inline(|vfs| vfs.list_xattrs(*h))
     }
 
     async fn get_xattr(&self, _ctx: &RequestContext, h: &Ino, name: &str) -> FsResult<Bytes> {
-        let (ino, name) = (*h, name.to_owned());
-        self.run(move |vfs| vfs.get_xattr(ino, &name).map(Bytes::from))
-            .await
+        self.inline(|vfs| vfs.get_xattr(*h, name).map(Bytes::from))
     }
 
     async fn set_xattr(
@@ -378,8 +380,7 @@ impl Symlinks<Ino> for BuildFs {
     }
 
     async fn readlink(&self, _ctx: &RequestContext, h: &Ino) -> FsResult<String> {
-        let ino = *h;
-        self.run(move |vfs| vfs.readlink(ino)).await
+        self.inline(|vfs| vfs.readlink(*h))
     }
 }
 
