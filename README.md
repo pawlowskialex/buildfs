@@ -1,8 +1,9 @@
 # buildfs
 
 A userspace filesystem for build artifacts that compresses everything with
-zstd. It is served to the macOS kernel over **NFSv4.1 on localhost**, so no
-kernel extension, FUSE or FSKit is required.
+zstd and stores identical content once. It is served to the macOS kernel
+over **NFSv4.1 on localhost**, so no kernel extension, FUSE or FSKit is
+required.
 
 ```sh
 cargo build --release
@@ -12,37 +13,56 @@ CARGO_TARGET_DIR=~/mnt/build/myproject cargo build
 ```
 
 `mount` serves and mounts in one process and unmounts on Ctrl-C/SIGTERM.
-No root needed. `serve` runs only the server (mount it yourself with
-`mount_nfs -o vers=4.1,tcp,port=20490,namedattr 127.0.0.1:/ <dir>`).
+No root needed. Put all projects' target directories under one mount so
+shared dependencies are stored once. `serve` runs only the server (mount it
+yourself with `mount_nfs -o vers=4.1,tcp,port=20490,namedattr 127.0.0.1:/ <dir>`).
+
+To keep a mount running across logins (restarted automatically if it
+crashes; logs in `~/Library/Logs/buildfs-<name>.log`):
+
+```sh
+buildfs install-agent --store ~/.buildfs-store ~/mnt/build
+buildfs uninstall-agent          # unmounts and removes the agent
+```
 
 | Option | Default | |
 |---|---|---|
 | `--compress-after <s>` | 15 | idle time before a file is compressed (0 = never) |
-| `--level <n>` | 3 | zstd level |
+| `--level <n>` | 3 | zstd level (see Compression settings) |
 | `--workers <n>` | cores/4 | background compression threads (utility QoS) |
 | `--sync relaxed\|strict` | relaxed | see Durability |
 | `-o <opts>` | | extra `mount_nfs` options |
 
 ## Results
 
-Clean debug build of this workspace (M-series Mac, APFS):
+Debug builds of this workspace (M-series Mac, APFS):
 
 | | APFS | buildfs |
 |---|---|---|
-| target size on disk | 513 MB | **170 MB** (3.0x; 675 of 1590 files inlined) |
+| one target dir | 513 MB | **170 MB** (3.0x) |
+| two target dirs, same deps | 1.1 GB | **184 MB** (6.1x: 3.06x zstd, 2x dedup) |
 | clean build | 10.6 s | 15.5 s |
-| incremental (leaf crate) | 0.8 s | 2.9 s (3.7 s on compressed artifacts) |
+| incremental (leaf crate) | 0.8 s | 2.9–4 s |
 | no-op | 0.12 s | 0.6 s |
 
-All 2279 artifacts verified byte-identical after compression and remount.
+All 4680 artifacts of the two-target run were byte-identical after
+compression and remount. Timings vary ±20% with machine load.
+
+**Conformance.** `scripts/pjdfstest.sh` runs the pjdfstest POSIX suite
+(8686 assertions, unprivileged) on APFS and on buildfs. Every assertion
+matches APFS except 69, all caused by the macOS NFS client: it reports no
+`_PC_PATH_MAX` (the `*/03.t` path-length tests) and refuses to open FIFOs
+itself (EACCES; no request reaches the server).
 
 ## Supported
 
-Files, directories, hard links, symlinks, FIFOs, sockets, device nodes,
-xattrs (stored natively via NFSv4 named attributes, including
-`com.apple.provenance`, no `._` files), chmod/chown/utimes/birthtime,
+Files, directories, hard links, symlinks, sockets, device nodes, FIFOs
+(created and listed; the client won't open them), xattrs (stored natively
+via NFSv4 named attributes, including `com.apple.provenance`, no `._`
+files), chmod/chown/chgrp by name or id, utimes/birthtime,
 hidden/archive/system flags, byte-range locks (advisory), sparse
-truncation, rename-over, filehandles that survive server restarts.
+truncation, rename-over, unlinked-but-open files (no `.nfs*` renames),
+filehandles that survive server restarts.
 
 ## Design
 
@@ -53,17 +73,26 @@ macOS NFS client ── NFSv4.1/TCP ── vendor/embednfs (patched) ── Buil
                      meta.redb  inodes · dirents · cookies · xattrs · inline
                      wal/       redo log (plain write(2), no fsync)
                      hot/       uncompressed files being written
-                     cold/      zstd images: 128 KiB chunks + index
+                     chunks/    content-addressed zstd chunks (> 2 KiB)
 ```
 
-- **Hot → cold.** Writes go to a plain per-inode file. Once a file has been
-  idle for `--compress-after` seconds, a worker compresses it into an image
-  of independently compressed 128 KiB chunks (stored raw if incompressible),
-  so random reads only decompress what they touch. Files that compress to
-  3 KiB or less are stored in redb, saving a 4 KiB block each. Writing to a
-  cold file rehydrates it first; truncating it to zero (`O_TRUNC`) just drops
-  the image. The NFS change attribute doesn't change, so client caches stay
-  valid. Writes that race with a compaction are detected and redone.
+- **Hot → chunks.** Writes go to a plain per-inode file. Once a file has
+  been idle for `--compress-after` seconds, a worker splits it into 128 KiB
+  chunks identified by the BLAKE3 hash of their contents. A chunk that is
+  already stored just gains a reference (no compression work); a new one is
+  compressed with zstd (or stored raw if that doesn't help) and kept in redb
+  if it is 2 KiB or less, otherwise as a file. Reads only decompress the
+  chunks they touch, through a cache keyed by hash. Files that compress to
+  3 KiB or less are stored whole in redb, which saves a 4 KiB block each.
+  Writing to a compressed file rehydrates it first; truncating it to zero
+  (`O_TRUNC`) just drops its references. The NFS change attribute doesn't
+  change, so client caches stay valid. Writes that race with a compaction
+  are detected and redone.
+- **Chunk lifetime.** Reference counts change only in metadata
+  transactions. A chunk file is written before its first reference commits
+  and deleted after its last reference is dropped. Deletion re-checks the
+  count under a lock that compaction also holds while committing, so a
+  delete racing a new reference can only make that compaction retry.
 - **Metadata** lives in redb. Inode numbers and readdir cookies come from
   monotonic counters and are never reused, which lets filehandles embed the
   inode number and lets directory listings be resumed while the directory
@@ -75,8 +104,34 @@ macOS NFS client ── NFSv4.1/TCP ── vendor/embednfs (patched) ── Buil
   the background. Writes reply `FILE_SYNC`, so the client skips COMMIT.
   `strict` mode: COMMIT fsyncs the file and waits for a group-committed
   durable metadata commit.
-- **Recovery.** At startup the WAL is replayed, orphaned hot/cold files are
-  removed, and files left uncompressed are queued for compression.
+- **Open files.** embednfs reports when open states start and end
+  (including lease expiry), and buildfs keeps unlinked inodes alive until
+  the last one closes. The server sets `OPEN4_RESULT_PRESERVE_UNLINKED`, so
+  the client removes open files directly instead of renaming them to
+  `.nfs*`.
+- **Recovery.** At startup the WAL is replayed, files unlinked while open
+  are freed, unreferenced hot and chunk files are removed, and files left
+  uncompressed are queued for compression. If a previous instance died with
+  the mount still in place, `mount` adopts it: the kernel client reconnects
+  on its own, and even file descriptors opened before the crash keep
+  working.
+
+## Compression settings
+
+Measured on the artifacts of two target directories (526 MiB of distinct
+chunks, `examples/compress_eval.rs`):
+
+| zstd level | ratio | speed (one core) |
+|---|---|---|
+| 1 | 2.84x | 602 MiB/s |
+| **3** (default) | 2.94x | 460 MiB/s |
+| 9 | 3.09x | 80 MiB/s |
+| 19 | 3.41x | 4 MiB/s |
+
+Compression runs in the background on utility-QoS threads, so a higher
+`--level` costs CPU and energy, not build time. Trained dictionaries add
+only 2.3% on 128 KiB chunks. They add 27% on small files, but those are
+under 10% of the bytes, so they aren't used.
 
 ## embednfs changes
 
@@ -91,8 +146,12 @@ upstream. The ones that matter most:
   crate" in about one of every 3–6 clean builds.
 - **Mandatory lock checks on READ/WRITE** broke `cp -p`, `ditto` and
   `fs::copy` (macOS locks a file and then reads it through its open stateid).
-- Stable filehandles, special files, a persistent server identity,
-  non-atomic `change_info`, and the `xattr_exists` hook.
+- **Owner strings.** Only numeric owners were parsed, so `chown`/`chgrp` by
+  name (macOS sends `root`, `wheel@host` and `EVERYONE@`) reported success
+  and changed nothing. Unknown names now fail with `NFS4ERR_BADOWNER`.
+- Open-state tracking with `PRESERVE_UNLINKED`, stable filehandles,
+  special files, a persistent server identity, non-atomic `change_info`,
+  and the `xattr_exists` hook.
 
 ## macOS NFS client notes
 
@@ -110,20 +169,26 @@ upstream. The ones that matter most:
 - After a server restart, the request in flight during reconnect can fail
   with EIO. This happens inside the client's session recovery ("freeing free
   slot", SEQ_MISORDERED); later requests and data are fine.
+- Read delegations don't help: the client returns them almost immediately
+  (about one DELEGRETURN per OPEN), which adds round trips. Most remaining
+  RPCs are lookups of path components in busy directories, which only
+  directory delegations could avoid.
+- Unmounting from a process started by launchd hangs in the kernel or fails
+  with EPERM. This is why the agent leaves its mount in place and
+  `uninstall-agent` unmounts from your shell.
 
 ## Roadmap
 
-- NFSv4.1 delegations, so the client can handle opens, locks and attributes
-  locally. Remaining overhead is per-RPC client latency (about 20k RPCs per
-  incremental build).
-- Content-addressed chunks for dedup across projects and builds (identical
-  dependency builds in different `target/` directories).
-- Trained zstd dictionaries per artifact type (`.rmeta`, `.rlib`, `.o`).
-- pjdfstest in CI; a launchd agent; `buildfs stats`.
+- `buildfs stats` for a live mount (store usage, dedup ratio).
+- Garbage collection for stale artifacts (e.g. drop chunks of files unread
+  for N days), a store size limit.
+- Pursue upstreaming the embednfs patches.
 
 ## Development
 
 ```sh
 cargo test --workspace            # embednfs protocol suite + buildfs VFS tests
+scripts/pjdfstest.sh              # POSIX suite, diffed against APFS (~8 min)
 cargo run --release -p buildfs --example vfs_bench
+cargo run --release -p buildfs --example compress_eval -- <dirs>
 ```
