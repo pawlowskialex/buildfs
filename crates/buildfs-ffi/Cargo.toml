@@ -1,0 +1,25 @@
+[package]
+name = "buildfs-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "C API over the buildfs core, for the FSKit extension"
+publish = false
+
+[lib]
+# staticlib for the FSKit extension; rlib so `cargo test` can call the C API.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+buildfs = { path = "../buildfs" }
+embednfs = { path = "../../vendor/embednfs" }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+cbindgen = { version = "0.29", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

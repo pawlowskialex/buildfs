@@ -730,6 +730,14 @@ impl Vfs {
                 None => return,
             }
         }
+        // Fast path: almost every closed file still has a name. Our count is
+        // already gone, so a concurrent unlink after this check frees the
+        // inode itself (`drop_link` sees no open state).
+        match self.getattr(ino) {
+            Ok(i) if i.nlink > 0 || i.kind == Kind::Dir => return,
+            Err(FsError::Stale) => return,
+            _ => {}
+        }
         let r = self.write(|w| {
             let inode = match w.get(ino) {
                 Ok(i) => i,
@@ -941,6 +949,21 @@ impl Vfs {
         let dirents = txn.open_table(DIRENTS).db()?;
         let v = dirents.get((dir, name)).db()?.ok_or(FsError::NotFound)?;
         Ok(v.value().0)
+    }
+
+    /// [`lookup`](Self::lookup) plus [`getattr`](Self::getattr) of the
+    /// child, in one read transaction.
+    pub fn lookup_attr(&self, dir: Ino, name: &str) -> Result<(Ino, Inode)> {
+        let txn = self.db.begin_read().db()?;
+        let inodes = txn.open_table(INODES).db()?;
+        let d = inodes.get(dir).db()?.ok_or(FsError::Stale)?;
+        if Inode::decode(d.value()).map_err(db_err)?.kind != Kind::Dir {
+            return Err(FsError::NotDirectory);
+        }
+        let dirents = txn.open_table(DIRENTS).db()?;
+        let ino = dirents.get((dir, name)).db()?.ok_or(FsError::NotFound)?.value().0;
+        let v = inodes.get(ino).db()?.ok_or(FsError::Stale)?;
+        Ok((ino, Inode::decode(v.value()).map_err(db_err)?))
     }
 
     pub fn parent(&self, dir: Ino) -> Result<Option<Ino>> {

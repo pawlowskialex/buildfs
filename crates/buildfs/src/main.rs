@@ -163,6 +163,10 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "info,embednfs=warn".into()),
         )
         .init();
+    match buildfs::raise_fd_limit() {
+        Ok(n) => tracing::debug!("open file limit: {n}"),
+        Err(e) => tracing::warn!("could not raise the open file limit: {e}"),
+    }
 
     match Cli::parse().cmd {
         Cmd::Serve { store: args, listen } => {
