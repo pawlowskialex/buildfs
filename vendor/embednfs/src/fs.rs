@@ -596,6 +596,22 @@ pub trait Xattrs<H>: Send + Sync {
 
     /// Remove a named attribute.
     async fn remove_xattr(&self, ctx: &RequestContext, handle: &H, name: &str) -> FsResult<()>;
+
+    /// Whether `name` exists for lookups and OPEN-without-create.
+    ///
+    /// Defaults to probing [`Xattrs::get_xattr`]. Backends can report an
+    /// attribute as absent here while still serving `get_xattr` for an
+    /// attribute that was just created through an open filehandle.
+    async fn xattr_exists(&self, ctx: &RequestContext, handle: &H, name: &str) -> FsResult<bool>
+    where
+        H: Sync,
+    {
+        match self.get_xattr(ctx, handle, name).await {
+            Ok(_) => Ok(true),
+            Err(FsError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Optional symbolic-link support.

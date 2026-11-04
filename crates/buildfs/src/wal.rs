@@ -31,6 +31,8 @@ pub enum Mutation {
     XattrPut(u64, String, Vec<u8>),
     XattrDel(u64, String),
     Counter(String, u64),
+    InlinePut(u64, Vec<u8>),
+    InlineDel(u64),
 }
 
 pub struct Wal {

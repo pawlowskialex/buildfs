@@ -404,24 +404,246 @@ fn wal_recovers_metadata_after_process_crash() {
     vfs.shutdown();
 }
 
+
+// ----- compression tiers ----------------------------------------------------
+
+fn manual_compaction() -> Options {
+    Options {
+        compress_after: None, // tests drive compaction explicitly
+        ..Options::default()
+    }
+}
+
+fn artifact(len: usize) -> Vec<u8> {
+    // Compressible like real object code: repetitive symbols plus noise.
+    let mut out = Vec::with_capacity(len);
+    let mut x = 0x9e37_79b9u32;
+    let mut i = 0u32;
+    while out.len() < len {
+        out.extend_from_slice(format!("_ZN4core3fmt{i}Display3fmt").as_bytes());
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        out.extend_from_slice(&x.to_le_bytes()[..(x % 4) as usize]);
+        i = i.wrapping_add(1) % 500;
+    }
+    out.truncate(len);
+    out
+}
+
+fn read_all(vfs: &Vfs, ino: u64) -> Vec<u8> {
+    let size = vfs.getattr(ino).unwrap().size;
+    vfs.read(ino, 0, size as u32).unwrap().0
+}
+
 #[test]
-fn provenance_xattr_is_dropped_by_default() {
+fn compacts_large_file_to_cold_and_reads_randomly() {
+    use buildfs::meta::Data;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "libbig.rlib");
+    let data = artifact(3 * 1024 * 1024 + 12345);
+    for (i, chunk) in data.chunks(1 << 20).enumerate() {
+        vfs.write_data(f, (i << 20) as u64, chunk).unwrap();
+    }
+    let before = vfs.getattr(f).unwrap();
+    assert!(vfs.compact(f).unwrap());
+    let after = vfs.getattr(f).unwrap();
+    assert!(matches!(after.data, Data::Cold { .. }));
+    // Compression must not look like a modification to NFS clients.
+    assert_eq!(after.change, before.change);
+    assert_eq!(after.mtime, before.mtime);
+    let used = vfs.space_used(f, &after);
+    assert!(used * 2 < data.len() as u64, "used {used} of {}", data.len());
+    assert!(!tmp.path().join("hot/").read_dir().unwrap().any(|e| e
+        .unwrap()
+        .path()
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_some()));
+
+    assert_eq!(read_all(&vfs, f), data);
+    for (off, len) in [(0usize, 1usize), (131_071, 2), (1_000_000, 300_000), (data.len() - 5, 50)] {
+        let (got, eof) = vfs.read(f, off as u64, len as u32).unwrap();
+        let end = (off + len).min(data.len());
+        assert_eq!(got, data[off..end], "offset {off}");
+        assert_eq!(eof, end == data.len());
+    }
+}
+
+#[test]
+fn tiny_files_go_inline_and_empty_files_drop_data() {
+    use buildfs::meta::Data;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let d = mkfile(&vfs, ROOT_INO, "foo.d");
+    let dep = b"/target/debug/deps/foo.rmeta: src/lib.rs src/a.rs src/b.rs\n".repeat(20);
+    vfs.write_data(d, 0, &dep).unwrap();
+    assert!(vfs.compact(d).unwrap());
+    let inode = vfs.getattr(d).unwrap();
+    assert!(matches!(inode.data, Data::Inline { .. }), "{:?}", inode.data);
+    assert_eq!(read_all(&vfs, d), dep);
+    assert_eq!(vfs.read(d, 5, 10).unwrap().0, dep[5..15].to_vec());
+
+    let e = mkfile(&vfs, ROOT_INO, "empty");
+    vfs.write_data(e, 0, b"x").unwrap();
+    vfs.setattr(&user(), e, &SetAttrs { size: Some(0), ..attrs() }).unwrap();
+    assert!(vfs.compact(e).unwrap());
+    assert_eq!(vfs.getattr(e).unwrap().data, Data::Empty);
+}
+
+#[test]
+fn writes_rehydrate_and_truncate_drops_cold_data() {
+    use buildfs::meta::Data;
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "out");
+    let mut data = artifact(600_000);
+    vfs.write_data(f, 0, &data).unwrap();
+    assert!(vfs.compact(f).unwrap());
+
+    // In-place write into the middle of a cold file.
+    vfs.write_data(f, 200_000, b"PATCHED").unwrap();
+    data[200_000..200_007].copy_from_slice(b"PATCHED");
+    assert_eq!(vfs.getattr(f).unwrap().data, Data::Hot);
+    assert_eq!(read_all(&vfs, f), data);
+    assert_eq!(vfs.compress_stats().rehydrated, 1);
+
+    // Recompress, then shrink (needs the bytes) and truncate (doesn't).
+    assert!(vfs.compact(f).unwrap());
+    vfs.setattr(&user(), f, &SetAttrs { size: Some(1000), ..attrs() }).unwrap();
+    assert_eq!(read_all(&vfs, f), data[..1000].to_vec());
+    assert!(vfs.compact(f).unwrap());
+    vfs.setattr(&user(), f, &SetAttrs { size: Some(0), ..attrs() }).unwrap();
+    assert_eq!(vfs.getattr(f).unwrap().data, Data::Empty);
+    vfs.write_data(f, 0, b"fresh").unwrap();
+    assert_eq!(read_all(&vfs, f), b"fresh".to_vec());
+}
+
+#[test]
+fn unlink_frees_cold_and_inline_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let big = mkfile(&vfs, ROOT_INO, "big");
+    vfs.write_data(big, 0, &artifact(500_000)).unwrap();
+    let small = mkfile(&vfs, ROOT_INO, "small");
+    vfs.write_data(small, 0, b"tiny").unwrap();
+    assert!(vfs.compact(big).unwrap());
+    assert!(vfs.compact(small).unwrap());
+    let cold_files = || {
+        walk(&tmp.path().join("cold"))
+            .into_iter()
+            .filter(|p| !p.to_string_lossy().contains("/tmp/"))
+            .count()
+    };
+    assert_eq!(cold_files(), 1);
+    vfs.remove(ROOT_INO, "big").unwrap();
+    vfs.remove(ROOT_INO, "small").unwrap();
+    assert_eq!(cold_files(), 0);
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn cold_data_survives_crash_and_orphans_are_collected() {
+    let live = tempfile::tempdir().unwrap();
+    let crashed = tempfile::tempdir().unwrap();
+    let opts = Options {
+        flush_interval: None,
+        ..manual_compaction()
+    };
+    let vfs = Vfs::open_with(live.path(), opts.clone()).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "a.rlib");
+    let data = artifact(400_000);
+    vfs.write_data(f, 0, &data).unwrap();
+    assert!(vfs.compact(f).unwrap());
+    let g = mkfile(&vfs, ROOT_INO, "b.d");
+    vfs.write_data(g, 0, b"deps: x y z").unwrap();
+    assert!(vfs.compact(g).unwrap());
+    snapshot_store(live.path(), crashed.path());
+    // An orphaned cold image left by a crash mid-publish.
+    let orphan = crashed.path().join("cold/ff/00000000000000ff-1");
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"junk").unwrap();
+
+    let rec = Vfs::open_with(crashed.path(), opts).unwrap();
+    assert_eq!(read_all(&rec, f), data);
+    assert_eq!(read_all(&rec, g), b"deps: x y z".to_vec());
+    assert!(!orphan.exists());
+    vfs.shutdown();
+}
+
+#[test]
+fn concurrent_writes_never_lose_data_to_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "racy");
+    let block = 64 * 1024;
+    let blocks = 24;
+    vfs.write_data(f, 0, &vec![0u8; block * blocks]).unwrap();
+    std::thread::scope(|s| {
+        let v = &vfs;
+        s.spawn(move || {
+            for _ in 0..200 {
+                let _ = v.compact(f);
+            }
+        });
+        s.spawn(move || {
+            for i in 0..blocks {
+                v.write_data(f, (i * block) as u64, &vec![i as u8 + 1; block])
+                    .unwrap();
+            }
+        });
+    });
+    let got = read_all(&vfs, f);
+    for i in 0..blocks {
+        assert!(
+            got[i * block..(i + 1) * block].iter().all(|&b| b == i as u8 + 1),
+            "block {i} lost"
+        );
+    }
+}
+
+#[test]
+fn background_compactor_runs_after_idle_delay() {
+    use buildfs::meta::Data;
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = Options {
+        compress_after: Some(std::time::Duration::from_millis(200)),
+        ..Options::default()
+    };
+    let vfs = Vfs::open_with(tmp.path(), opts).unwrap();
+    let f = mkfile(&vfs, ROOT_INO, "x.o");
+    vfs.write_data(f, 0, &artifact(300_000)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while vfs.getattr(f).unwrap().data == Data::Hot {
+        assert!(std::time::Instant::now() < deadline, "never compacted");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(matches!(vfs.getattr(f).unwrap().data, Data::Cold { .. }));
+    vfs.shutdown();
+}
+
+#[test]
+fn every_xattr_is_stored_including_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open(tmp.path()).unwrap();
     let f = mkfile(&vfs, ROOT_INO, "f");
-    vfs.set_xattr(f, "com.apple.provenance", b"\x01", XattrSetMode::CreateOrReplace)
+    assert!(!vfs.xattr_exists(f, "com.apple.provenance").unwrap());
+    vfs.set_xattr(f, "com.apple.provenance", b"\x01\x02", XattrSetMode::CreateOrReplace)
         .unwrap();
-    assert_eq!(vfs.get_xattr(f, "com.apple.provenance").err(), Some(FsError::NotFound));
-    assert_eq!(vfs.getattr(f).unwrap().xattr_count, 0);
-
-    let keep = tempfile::tempdir().unwrap();
-    let opts = Options {
-        dropped_xattrs: vec![],
-        ..Options::default()
-    };
-    let vfs = Vfs::open_with(keep.path(), opts).unwrap();
-    let f = mkfile(&vfs, ROOT_INO, "f");
-    vfs.set_xattr(f, "com.apple.provenance", b"\x01", XattrSetMode::CreateOrReplace)
-        .unwrap();
-    assert_eq!(vfs.get_xattr(f, "com.apple.provenance").unwrap(), b"\x01");
+    assert!(vfs.xattr_exists(f, "com.apple.provenance").unwrap());
+    assert_eq!(vfs.get_xattr(f, "com.apple.provenance").unwrap(), b"\x01\x02");
 }

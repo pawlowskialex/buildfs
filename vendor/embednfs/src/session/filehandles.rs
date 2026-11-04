@@ -31,7 +31,12 @@ impl StateManager {
             (9..=NFS4_FHSIZE).contains(&len)
                 && matches!(
                     fh.0.first(),
-                    Some(&(FH_TAG_FS | FH_TAG_NAMED_ATTR_DIR | FH_TAG_NAMED_ATTR_FILE | FH_TAG_TABLE))
+                    Some(
+                        &(FH_TAG_FS
+                            | FH_TAG_NAMED_ATTR_DIR
+                            | FH_TAG_NAMED_ATTR_FILE
+                            | FH_TAG_TABLE)
+                    )
                 )
         } else {
             len == std::mem::size_of::<u64>()

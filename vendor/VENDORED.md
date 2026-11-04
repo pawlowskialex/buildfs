@@ -21,3 +21,8 @@ Tracked in git history of this repo. Summary kept below.
 - **Stable readdir cookies** (`FsCapabilities::stable_readdir_cookies`): constant
   cookie verifier instead of NOT_SAME on every directory change. Without this,
   macOS sees truncated listings of busy directories (rustc "can't find crate").
+- **Advisory locking option** (`NfsServerBuilder::mandatory_io_locks(false)`):
+  READ/WRITE no longer fail with NFS4ERR_LOCKED against byte-range locks.
+  macOS (e.g. its AppleDouble code) locks then reads via the open stateid.
+- **`Xattrs::xattr_exists`** hook used by named-attribute LOOKUP and OPEN
+  existence checks (defaults to probing `get_xattr`).

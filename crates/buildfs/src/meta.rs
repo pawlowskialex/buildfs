@@ -6,6 +6,7 @@
 //! - `dircookies`:  (dir ino, cookie) -> name      (stable readdir order/resume)
 //! - `xattrs`:      (ino, name) -> value
 //! - `counters`:    name -> u64                    (next inode / cookie)
+//! - `inline`:      ino -> zstd bytes              (tiny compressed files)
 //!
 //! Inode numbers and readdir cookies are allocated from monotonic counters and
 //! never reused, so NFS filehandles that embed an inode number can never
@@ -28,6 +29,8 @@ pub const DIRENTS: TableDefinition<(u64, &str), (u64, u64)> = TableDefinition::n
 pub const DIRCOOKIES: TableDefinition<(u64, u64), &str> = TableDefinition::new("dircookies");
 pub const XATTRS: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("xattrs");
 pub const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
+/// ino -> zstd frame of the whole file, for files that compress tiny.
+pub const INLINE: TableDefinition<u64, &[u8]> = TableDefinition::new("inline");
 
 pub const NEXT_INO: &str = "next_ino";
 pub const NEXT_COOKIE: &str = "next_cookie";
@@ -70,6 +73,10 @@ pub enum Data {
     Empty,
     /// Uncompressed file in the hot store, named after the inode.
     Hot,
+    /// Compressed image in the cold store (`cold/<ino>-<gen>`).
+    Cold { gen_: u64, disk: u64 },
+    /// Compressed bytes in the `inline` table (`disk` = stored length).
+    Inline { disk: u32 },
 }
 
 pub const FLAG_HIDDEN: u8 = 1;

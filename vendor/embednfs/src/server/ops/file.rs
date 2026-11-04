@@ -90,17 +90,18 @@ impl<F: FileSystem> NfsServer<F> {
         {
             return Err(NfsStat4::Locked);
         }
-        if self
-            .state
-            .has_conflicting_io_lock(
-                object,
-                lock_owner,
-                io.is_write,
-                io.offset,
-                io.length,
-                ignore_lock,
-            )
-            .await
+        if self.mandatory_io_locks
+            && self
+                .state
+                .has_conflicting_io_lock(
+                    object,
+                    lock_owner,
+                    io.is_write,
+                    io.offset,
+                    io.length,
+                    ignore_lock,
+                )
+                .await
         {
             return Err(NfsStat4::Locked);
         }
@@ -320,8 +321,13 @@ impl<F: FileSystem> NfsServer<F> {
                     Ok(handle) => handle,
                     Err(e) => return NfsResop4::Open(e.to_nfsstat4(), None),
                 };
-                match named.get_xattr(request_ctx, &parent_handle, name).await {
-                    Ok(_) => {
+                let exists = match named.xattr_exists(request_ctx, &parent_handle, name).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(FsError::NotFound),
+                    Err(e) => Err(e),
+                };
+                match exists {
+                    Ok(()) => {
                         if let Openflag4::Create(how) = &args.openhow
                             && Self::create_mode_requires_nonexistence(how)
                         {

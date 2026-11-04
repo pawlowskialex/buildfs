@@ -92,6 +92,7 @@ pub struct NfsServerBuilder<F: FileSystem> {
     id_mapper: Arc<dyn IdMapper>,
     max_concurrent_requests: usize,
     server_identity: Option<Bytes>,
+    mandatory_io_locks: bool,
 }
 
 impl<F: FileSystem> NfsServerBuilder<F> {
@@ -105,6 +106,18 @@ impl<F: FileSystem> NfsServerBuilder<F> {
     /// recover transparently.
     pub fn server_identity(mut self, identity: impl Into<Bytes>) -> Self {
         self.server_identity = Some(identity.into());
+        self
+    }
+
+    /// Whether READ/WRITE are refused with `NFS4ERR_LOCKED` when they overlap
+    /// a byte-range lock held by another lock owner (mandatory locking).
+    ///
+    /// Defaults to `true`. Pass `false` for POSIX advisory semantics, where
+    /// locks only conflict with other locks; this is what clients such as
+    /// macOS expect (its AppleDouble xattr code locks a file and then reads
+    /// it through its open stateid).
+    pub fn mandatory_io_locks(mut self, enabled: bool) -> Self {
+        self.mandatory_io_locks = enabled;
         self
     }
 
@@ -140,6 +153,7 @@ impl<F: FileSystem> NfsServerBuilder<F> {
             object_to_handle: Arc::new(RwLock::new(HashMap::new())),
             next_object_id: AtomicU64::new(1),
             id_mapper: self.id_mapper,
+            mandatory_io_locks: self.mandatory_io_locks,
             max_concurrent_requests: self.max_concurrent_requests,
         }
     }
@@ -154,6 +168,7 @@ pub struct NfsServer<F: FileSystem> {
     next_object_id: AtomicU64,
     id_mapper: Arc<dyn IdMapper>,
     max_concurrent_requests: usize,
+    mandatory_io_locks: bool,
 }
 
 impl<F: FileSystem> NfsServer<F> {
@@ -164,6 +179,7 @@ impl<F: FileSystem> NfsServer<F> {
             id_mapper: Arc::new(NumericIdMapper),
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
             server_identity: None,
+            mandatory_io_locks: true,
         }
     }
 

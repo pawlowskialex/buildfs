@@ -115,6 +115,7 @@ impl FileSystem for BuildFs {
     async fn statfs(&self, _ctx: &RequestContext) -> FsResult<FsStats> {
         self.inline(|vfs| {
             let st = vfs.statfs()?;
+            #[allow(clippy::unnecessary_cast, reason = "f_frsize width differs across platforms")]
             let frsize = st.f_frsize as u64;
             Ok(FsStats {
                 total_bytes: st.f_blocks as u64 * frsize,
@@ -343,6 +344,10 @@ impl Xattrs<Ino> for BuildFs {
         let (ino, name) = (*h, name.to_owned());
         self.run(move |vfs| vfs.set_xattr(ino, &name, &value, mode))
             .await
+    }
+
+    async fn xattr_exists(&self, _ctx: &RequestContext, h: &Ino, name: &str) -> FsResult<bool> {
+        self.inline(|vfs| vfs.xattr_exists(*h, name))
     }
 
     async fn remove_xattr(&self, _ctx: &RequestContext, h: &Ino, name: &str) -> FsResult<()> {

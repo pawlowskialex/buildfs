@@ -212,13 +212,14 @@ impl<F: FileSystem> NfsServer<F> {
                     Err(e) => return NfsResop4::Lookup(e.to_nfsstat4()),
                 };
                 match named
-                    .get_xattr(request_ctx, &parent_handle, &args.objname)
+                    .xattr_exists(request_ctx, &parent_handle, &args.objname)
                     .await
                 {
-                    Ok(_) => Ok(ServerObject::NamedAttrFile {
+                    Ok(true) => Ok(ServerObject::NamedAttrFile {
                         parent,
                         name: args.objname.clone(),
                     }),
+                    Ok(false) => Err(FsError::NotFound),
                     Err(e) => Err(e),
                 }
             }
