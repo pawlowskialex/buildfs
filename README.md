@@ -10,7 +10,7 @@ There are two front ends over the same core:
 | Setup | build and enable an app extension | none |
 | Server process | none (`fskitd` runs the module) | yes |
 | FIFOs, sockets, device nodes | no | yes |
-| `--sync strict` | no | yes |
+| `--sync strict`, clean build | 2.5x slower | 1.4x slower |
 | Attachments share dedup with the root | large chunks only (shared pool) | yes |
 
 ## Quick start: FSKit
@@ -83,7 +83,7 @@ buildfs uninstall-agent          # unmounts and removes the agent
 | `--compress-after <s>` | 15 | idle time before a file is compressed (0 = never) |
 | `--level <n>` | 3 | zstd level (see Compression settings) |
 | `--workers <n>` | cores/4 | background compression threads (utility QoS) |
-| `--sync relaxed\|strict` | relaxed | see Durability (NFS only) |
+| `--sync relaxed\|strict` | relaxed | see Durability |
 | `-o <opts>` | | extra mount options |
 
 ## Integrating with toolchains
@@ -243,7 +243,19 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   kernel panic or power loss. Durable redb commits happen once a second in
   the background. Writes reply `FILE_SYNC`, so the client skips COMMIT.
   `strict` mode: COMMIT fsyncs the file and waits for a group-committed
-  durable metadata commit.
+  durable metadata commit. On FSKit, which never reports an `fsync`, every write
+  does the same before it replies, since dirty data only arrives on `fsync`,
+  close or kernel writeback. Both use `F_FULLFSYNC`. That costs about 19 ms per
+  file written and closed on FSKit (1 ms in relaxed mode) and 30 ms on NFS; a
+  clean `cargo build` took 28 s against 11 s in relaxed mode, and 29 s on NFS.
+
+  Strict mode covers file data and the metadata committed with it. A change with
+  no file data (create, rename, chmod, xattrs) waits for the next barrier, which
+  is at most about a second away, in both front ends: renaming a file and then
+  losing power can lose the rename. On FSKit, an `fsync` with no dirty data never
+  reaches buildfs, so it can't shorten that wait, including an `fsync` of a
+  directory. Strict mode has been measured but not tested against a real power
+  failure.
 - **Open files.** embednfs reports when open states start and end
   (including lease expiry), and buildfs keeps unlinked inodes alive until
   the last one closes. The server sets `OPEN4_RESULT_PRESERVE_UNLINKED`, so
@@ -285,8 +297,10 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   is called: `mkfifo` and `bind` fail with `ENOTSUP`.
 - **Fixed behaviour.** `noatime` is always on. `_PC_PATH_MAX` and
   `_PC_PIPE_BUF` return `EINVAL`, as on NFS.
-- **`--sync strict`** isn't available: the kernel's write-back cache decides
-  when data reaches buildfs. Use `fsync`, which reaches it.
+- **`fsync` isn't visible to the module.** FSKit doesn't call `synchronize` on
+  `fsync` or `F_FULLFSYNC`; dirty data just arrives as writes. So `--sync strict`
+  makes every write durable before replying, whether or not `fsync` follows.
+  See Durability.
 - **Not tested yet:** the agent across a real reboot or logout, sleep and
   wake, and Xcode.app itself (only `xcodebuild`).
 

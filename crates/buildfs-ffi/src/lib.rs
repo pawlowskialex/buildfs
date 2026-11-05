@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use buildfs_core::meta::{FLAG_ARCHIVE, FLAG_HIDDEN, Ino, Inode, Kind};
-use buildfs_core::vfs::{Caller, NewNode, Options, Vfs};
+use buildfs_core::vfs::{Caller, NewNode, Options, SyncMode, Vfs};
 use buildfs_core::{FsError, SetAttrs, SetTime, Timestamp, XattrSetMode};
 
 /// An open store. Opaque to C.
@@ -159,6 +159,8 @@ pub struct BfsOptions {
     /// Directory for sharing chunk files with other stores, on the same file
     /// system (NUL-terminated); null = don't share.
     pub chunk_pool: *const c_char,
+    /// Make every write durable before `bfs_write` returns (`--sync strict`).
+    pub strict: bool,
 }
 
 impl Default for BfsOptions {
@@ -169,6 +171,7 @@ impl Default for BfsOptions {
             zstd_level: 0,
             cache_bytes: 0,
             chunk_pool: std::ptr::null(),
+            strict: false,
         }
     }
 }
@@ -583,6 +586,9 @@ pub unsafe extern "C" fn bfs_open(
         // SAFETY: guaranteed by the caller.
         let o = unsafe { opts.as_ref() }.copied().unwrap_or_default();
         let mut options = Options::default();
+        if o.strict {
+            options.sync = SyncMode::Strict;
+        }
         match o.compress_after_ms {
             0 => {}
             ms if ms < 0 => options.compress_after = None,
@@ -1061,6 +1067,11 @@ pub unsafe extern "C" fn bfs_write(
             return Err(libc::EINVAL);
         }
         let n = vfs.write_data(ino, offset, data).en()?;
+        // FSKit never tells the module about an fsync (it doesn't call
+        // `synchronize`). But dirty data only arrives here on fsync, close or
+        // kernel writeback, so in strict mode, making each write durable before
+        // replying is what keeps fsync's promise. Does nothing in relaxed mode.
+        vfs.commit(ino).en()?;
         let a = getattr(vfs, ino)?;
         // SAFETY: guaranteed by the caller.
         unsafe {

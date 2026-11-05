@@ -408,6 +408,7 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             mountOpts.first { $0.hasPrefix(key + "=") }.flatMap { Int($0.dropFirst(key.count + 1)) }
         }
         var opts = BfsOptions()
+        opts.strict = mountOpts.contains("strict")
         if let n = value("level") { opts.zstd_level = Int32(n) }
         if let n = value("workers"), n > 0 { opts.compress_workers = UInt32(n) }
         // Seconds without writes before compressing; 0 = never.
@@ -431,7 +432,7 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             root = n
             return n
         }
-        log.notice("activated store \(self.storeName, privacy: .public) at \(dir, privacy: .public) options=\(options.taskOptions, privacy: .public)")
+        log.notice("activated store \(self.storeName, privacy: .public) at \(dir, privacy: .public) sync=\(opts.strict ? "strict" : "relaxed", privacy: .public) options=\(options.taskOptions, privacy: .public)")
         reply(FSActivateResult(rootItem: r), nil)
     }
 

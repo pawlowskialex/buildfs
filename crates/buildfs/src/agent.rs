@@ -141,6 +141,8 @@ fn fskit_argv(exe: &Path, name: &str, args: &Tuning, mountpoint: &Path) -> Vec<S
         args.level.to_string(),
         "--compress-after".into(),
         args.compress_after.to_string(),
+        "--sync".into(),
+        sync_arg(args.sync),
     ];
     if let Some(w) = args.workers {
         argv.extend(["--workers".into(), w.to_string()]);
@@ -336,6 +338,13 @@ mod tests {
         assert_eq!(plist_args(&text).unwrap(), argv);
         assert_eq!(argv.last().unwrap(), "/mnt/my build");
         assert!(argv.iter().any(|a| a == "--fskit"));
+    }
+
+    #[test]
+    fn fskit_agent_keeps_strict() {
+        let args = Tuning { sync: crate::Sync::Strict, ..tuning() };
+        let argv = fskit_argv(Path::new("/b"), "x", &args, Path::new("/m"));
+        assert!(argv.windows(2).any(|w| w[0] == "--sync" && w[1] == "strict"));
     }
 
     #[test]

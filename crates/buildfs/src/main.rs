@@ -62,11 +62,11 @@ pub(crate) struct Tuning {
 
 impl Tuning {
     /// Mount options carrying the settings to the FSKit module.
-    fn fskit_options(&self) -> anyhow::Result<Vec<String>> {
-        if matches!(self.sync, Sync::Strict) {
-            bail!("--sync strict needs the NFS front end: with FSKit, the kernel's write-back cache decides when data reaches buildfs");
-        }
+    fn fskit_options(&self) -> Vec<String> {
         let mut o = Vec::new();
+        if matches!(self.sync, Sync::Strict) {
+            o.push("strict".to_owned());
+        }
         if self.level != 3 {
             o.push(format!("level={}", self.level));
         }
@@ -76,7 +76,7 @@ impl Tuning {
         if let Some(w) = self.workers {
             o.push(format!("workers={w}"));
         }
-        Ok(o)
+        o
     }
 
     fn options(&self) -> Options {
@@ -432,7 +432,7 @@ fn note_unused_nfs_store(name: &str) {
 /// only log the problem every 30 s. Leaves the mounting to the agent.
 fn probe_fskit(name: &str, tuning: &Tuning, mountpoint: &Path) -> anyhow::Result<()> {
     mounts::validate_store_name(name)?;
-    let options = tuning.fskit_options()?;
+    let options = tuning.fskit_options();
     std::fs::create_dir_all(mountpoint).context("create mountpoint")?;
     let real = resolve_mountpoint(mountpoint)?;
     if mounted_from(&real).is_none() {
@@ -534,7 +534,7 @@ fn mount_fskit(name: &str, tuning: &Tuning, mountpoint: &Path, extra: Option<&st
     if name.starts_with(mounts::FSKIT_ATTACH_PREFIX) {
         bail!("store names starting with {} are reserved for attachments", mounts::FSKIT_ATTACH_PREFIX);
     }
-    let mut options = tuning.fskit_options()?;
+    let mut options = tuning.fskit_options();
     options.extend(extra.into_iter().flat_map(|e| e.split(',')).map(str::to_owned));
     let mountpoint = resolve_mountpoint(mountpoint)?;
     match mounted_from(&mountpoint) {
@@ -855,11 +855,11 @@ mod tests {
     #[test]
     fn fskit_options_carry_only_non_defaults() {
         let t = |level, compress_after, workers, sync| Tuning { sync, level, compress_after, workers };
-        assert!(t(3, 15, None, Sync::Relaxed).fskit_options().unwrap().is_empty());
+        assert!(t(3, 15, None, Sync::Relaxed).fskit_options().is_empty());
         assert_eq!(
-            t(9, 0, Some(2), Sync::Relaxed).fskit_options().unwrap(),
+            t(9, 0, Some(2), Sync::Relaxed).fskit_options(),
             ["level=9", "compress_after=0", "workers=2"]
         );
-        assert!(t(3, 15, None, Sync::Strict).fskit_options().is_err());
+        assert_eq!(t(3, 15, None, Sync::Strict).fskit_options(), ["strict"]);
     }
 }

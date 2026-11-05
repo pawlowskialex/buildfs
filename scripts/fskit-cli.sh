@@ -45,7 +45,6 @@ check "mount again is a no-op" "$B" mount --fskit --name "$STORE" "$M"
 check "other store on the same mountpoint is refused" bash -c "! '$B' mount --fskit --name other '$M' 2>/dev/null"
 check "reserved store name is refused" bash -c "! '$B' mount --fskit --name att-x '$T/other' 2>/dev/null"
 check "bad store name is refused" bash -c "! '$B' mount --fskit --name 'A_b' '$T/other' 2>/dev/null"
-check "--sync strict is refused" bash -c "! '$B' mount --fskit --sync strict '$T/other' 2>/dev/null"
 check "files work" bash -c "echo hi > '$M/f' && [[ \$(cat '$M/f') == hi ]]"
 check "chgrp works" bash -c "g=\$(id -G | tr ' ' '\n' | grep -vx \$(id -g) | head -1); chgrp \$g '$M/f' && [[ \$(/usr/bin/stat -f %g '$M/f') == \$g ]]"
 
@@ -208,6 +207,13 @@ check "uninstall the NFS agent" bash -c "'$B' uninstall-agent --name '$NS' && ! 
 wait_for 10 bash -c "! nfs_server" > /dev/null
 check "delete-store --backend nfs" bash -c "'$B' delete-store --backend nfs '$NS' && [[ ! -e '$NSTORE' ]]"
 check "delete-store of no NFS store fails" bash -c "! '$B' delete-store --backend nfs '$NS' 2>/dev/null"
+
+# --sync strict on FSKit
+since=$(date "+%Y-%m-%d %H:%M:%S")
+check "--sync strict mounts" bash -c "'$B' mount --fskit --sync strict --name '$STORE' '$M' && echo strict > '$M/s' && [[ \$(cat '$M/s') == strict ]]"
+"$B" unmount --mount "$M" > /dev/null
+python3 -I -c 'import time; time.sleep(1)'
+if /usr/bin/log show --start "$since" --predicate "subsystem == \"com.pawlowskialex.buildfs.fsmodule\" AND eventMessage BEGINSWITH \"activated store $STORE \"" 2>/dev/null | grep -q 'sync=strict'; then ok "the module got it"; else bad "the module got it"; fi
 
 # Throwaway stores and registry
 "$B" delete-store "$AU" > /dev/null

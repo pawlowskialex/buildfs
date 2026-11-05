@@ -120,6 +120,10 @@ typedef struct BfsOptions {
    * system (NUL-terminated); null = don't share.
    */
   const char *chunk_pool;
+  /**
+   * Make every write durable before `bfs_write` returns (`--sync strict`).
+   */
+  bool strict;
 } BfsOptions;
 
 /**
