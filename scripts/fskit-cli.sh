@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end test of the FSKit parts of the CLI: mount, unmount, integrate,
+# End-to-end test of the CLI: choosing a backend, mount, unmount, integrate,
 # attach, detach, and the launchd agent. Uses throwaway stores, directories
-# under /tmp, a temporary CARGO_HOME, and a temporary agent.
+# under /tmp, a temporary CARGO_HOME, and temporary agents. The FSKit module
+# must be installed and enabled.
+#
+# Not covered, because it means switching the module off by hand: a disabled
+# module (mount says how to turn it on, and doesn't use NFS instead). Other
+# Macs are simulated: BUILDFS_TEST_MACOS_VERSION, BUILDFS_TEST_FSKIT_MODULE.
 #
 #   cargo build --release -p buildfs && scripts/fskit-cli.sh
 set -uo pipefail
@@ -22,10 +27,14 @@ wait_for() { # seconds, command...
   return 1
 }
 mkdir -p "$T"
+NS="$STORE-nfs"; NSTORE="$HOME/.buildfs/stores/$NS"
 cleanup() {
   "$B" uninstall-agent --name "$STORE-agent" > /dev/null 2>&1
-  for d in "$T"/*/; do mounted "${d%/}" && /sbin/umount "${d%/}"; done
-  rm -rf "$T"
+  "$B" uninstall-agent --name "$STORE-auto" > /dev/null 2>&1
+  "$B" uninstall-agent --name "$NS" > /dev/null 2>&1
+  for d in "$T"/*/ "$T"/*/*/; do mounted "${d%/}" && /sbin/umount "${d%/}"; done
+  pkill -f -- "--store $NSTORE" 2> /dev/null
+  rm -rf "$T" "$NSTORE"
 }
 trap cleanup EXIT
 
@@ -125,10 +134,86 @@ check "delete-store" "$B" delete-store "$STORE"
 check "the store is empty afterwards" bash -c "[[ -z \$(/bin/ls -A '$M') ]]"
 "$B" unmount --mount "$M" > /dev/null
 
+# Choosing a backend: what this Mac gets
+N="$T/nfs"
+from() { /sbin/mount | sed -nE "s|^(.*) on $1 \\(.*|\\1|p"; }
+export -f from
+nfs_server() { pgrep -f -- "--store $NSTORE" > /dev/null; }
+export -f nfs_server
+check "mount without flags uses FSKit here" bash -c "'$B' mount --name '$STORE' '$M' && [[ \$(from '$M') == buildfs://$STORE ]]"
+check "and repeating it is a no-op" bash -c "'$B' mount --name '$STORE' '$M' && [[ \$(from '$M') == buildfs://$STORE ]]"
+check "--foreground is refused with FSKit" bash -c "! '$B' mount --foreground --backend fskit --name '$STORE' '$T/other' 2>/dev/null"
+"$B" unmount --mount "$M" > /dev/null
+
+# NFS, chosen by flag: the same commands as FSKit
+check "--backend nfs returns once mounted" bash -c "'$B' mount --backend nfs --name '$NS' '$N' && [[ \$(from '$N') == 127.0.0.1:/ ]]"
+check "the store is in the default place" test -f "$NSTORE/meta.redb"
+check "the server is running, detached" nfs_server
+check "NFS files work" bash -c "echo nfs > '$N/f' && [[ \$(cat '$N/f') == nfs ]]"
+check "NFS mount again is a no-op" bash -c "'$B' mount --backend nfs --name '$NS' '$N' && [[ \$(pgrep -f -- '--store $NSTORE' | wc -l) -eq 1 ]]"
+check "without flags, a mount stays on its backend" bash -c "'$B' mount --name '$NS' '$N' && [[ \$(from '$N') == 127.0.0.1:/ && \$(pgrep -f -- '--store $NSTORE' | wc -l) -eq 1 ]]"
+check "another store on an NFS mountpoint is refused" bash -c "! '$B' mount --backend nfs --name '$NS-b' '$N' 2>/dev/null && [[ ! -e '$NSTORE-b' ]]"
+check "FSKit on an NFS mountpoint is refused" bash -c "! '$B' mount --backend fskit --name '$STORE' '$N' 2>/dev/null"
+check "a second NFS mount gets its own port" bash -c "'$B' mount --backend nfs --name '$NS-b' '$T/nfs2' && [[ \$(from '$T/nfs2') == 127.0.0.1:/ ]] && '$B' unmount --mount '$T/nfs2' > /dev/null && rm -rf '$NSTORE-b'"
+check "delete-store refuses a store in use" bash -c "! '$B' delete-store --backend nfs '$NS' 2>/dev/null && [[ \$(cat '$N/f') == nfs ]]"
+NP="$T/nfsproj"; mkdir -p "$NP/dir"
+check "attach on NFS" bash -c "'$B' attach --mount '$N' '$NP/dir' && echo att > '$NP/dir/a'"
+check "integrate shows the NFS mount" bash -c "'$B' integrate --mount '$N' | grep -q 'buildfs mount: $N'"
+check "unmount takes NFS attachments and the server along" bash -c "'$B' unmount --mount '$N' && ! /sbin/mount | grep -qE ' on ($N|$NP/dir) \\(' && ! nfs_server"
+check "mounting again restores data and attachments" bash -c "'$B' mount --backend nfs --name '$NS' '$N' && [[ \$(cat '$N/f') == nfs && \$(cat '$NP/dir/a') == att ]]"
+check "plain umount also stops the server" bash -c "/sbin/umount '$NP/dir' && /sbin/umount '$N' && for i in {1..100}; do nfs_server || exit 0; python3 -I -c 'import time; time.sleep(0.1)'; done; exit 1"
+"$B" mount --backend nfs --name "$NS" "$N" > /dev/null
+pkill -9 -f -- "--store $NSTORE"
+check "mounting recovers from a killed server" bash -c "'$B' mount --backend nfs --name '$NS' '$N' && [[ \$(cat '$N/f') == nfs && \$(cat '$NP/dir/a') == att ]]"
+check "SIGTERM unmounts" bash -c "pkill -f -- '--store $NSTORE'; for i in {1..100}; do /sbin/mount | grep -qE ' on ($N|$NP/dir) \\(' || exit 0; python3 -I -c 'import time; time.sleep(0.1)'; done; exit 1"
+
+# Other Macs, simulated
+check "macOS 26 uses NFS, and says why" bash -c "BUILDFS_TEST_MACOS_VERSION=26.4 '$B' mount --name '$NS' '$N' 2>&1 | grep -q 'FSKit needs macOS 27' && [[ \$(from '$N') == 127.0.0.1:/ ]]"
+"$B" unmount --mount "$N" > /dev/null
+check "no module uses NFS, and says why" bash -c "BUILDFS_TEST_FSKIT_MODULE=missing '$B' mount --name '$NS' '$N' 2>&1 | grep -q \"module isn't installed\" && [[ \$(from '$N') == 127.0.0.1:/ ]]"
+"$B" unmount --mount "$N" > /dev/null
+check "--backend fskit is honored on macOS 26" bash -c "BUILDFS_TEST_MACOS_VERSION=26.4 '$B' mount --backend fskit --name '$STORE' '$M' && [[ \$(from '$M') == buildfs://$STORE ]] && '$B' unmount --mount '$M' > /dev/null"
+check "FSKit mentions an NFS store it leaves unused" bash -c "'$B' mount --name '$NS' '$T/up' 2>&1 | grep -q 'delete-store --backend nfs' && [[ \$(from '$T/up') == buildfs://$NS ]] && '$B' unmount --mount '$T/up' > /dev/null && '$B' delete-store '$NS' > /dev/null"
+
+# The existing NFS form: foreground, explicit store
+"$B" mount --store "$NSTORE" --port 20555 "$N" > "$T/fg.log" 2>&1 &
+fg=$!
+if wait_for 15 mounted "$N"; then ok "--store stays in the foreground, mounted"; else bad "--store stays in the foreground, mounted" "$(tail -3 "$T/fg.log")"; fi
+if kill -0 $fg 2> /dev/null; then ok "the foreground server is still running"; else bad "the foreground server is still running"; fi
+check "unmount ends a foreground server" bash -c "'$B' unmount --mount '$N' && for i in {1..100}; do kill -0 $fg 2>/dev/null || exit 0; python3 -I -c 'import time; time.sleep(0.1)'; done; exit 1"
+wait $fg; rc=$?
+if [[ $rc == 0 ]]; then ok "and it exits cleanly"; else bad "and it exits cleanly" "status $rc"; fi
+
+# Agents: the backend is chosen once, at install
+AU="$STORE-auto"; AUM="$T/agentauto"
+check "install-agent without flags uses FSKit here" bash -c "'$B' install-agent --name '$AU' '$AUM' && grep -q -- '<string>--fskit</string>' '$HOME/Library/LaunchAgents/dev.buildfs.$AU.plist'"
+if wait_for 45 mounted "$AUM"; then ok "that agent mounted the volume"; else bad "that agent mounted the volume"; fi
+check "uninstall it" "$B" uninstall-agent --name "$AU"
+NA="$T/agentnfs"
+check "install-agent on macOS 26 uses NFS" bash -c "BUILDFS_TEST_MACOS_VERSION=26.4 '$B' install-agent --name '$NS' '$NA' 2>&1 | grep -q 'FSKit needs macOS 27'"
+check "its plist records the store and port" bash -c "grep -q '<string>$NSTORE</string>' '$HOME/Library/LaunchAgents/dev.buildfs.$NS.plist' && grep -q '<string>--port</string>' '$HOME/Library/LaunchAgents/dev.buildfs.$NS.plist'"
+if wait_for 30 mounted "$NA"; then ok "launchd keeps it on NFS on macOS 27 (as after an upgrade)"; else bad "launchd keeps it on NFS on macOS 27 (as after an upgrade)" "$(tail -3 "$HOME/Library/Logs/buildfs-$NS.log")"; fi
+check "still NFS" bash -c "[[ \$(from '$NA') == 127.0.0.1:/ && \$(cat '$NA/f') == nfs ]]"
+if wait_for 15 mounted "$NP/dir"; then ok "the NFS agent restores attachments under launchd"; else bad "the NFS agent restores attachments under launchd" "$(tail -3 "$HOME/Library/Logs/buildfs-$NS.log")"; fi
+check "and reaches its main loop" bash -c "grep -q 'mounted 127.0.0.1:/ at $NA' '$HOME/Library/Logs/buildfs-$NS.log'"
+served() { grep -c 'serving existing mount' "$HOME/Library/Logs/buildfs-$NS.log"; }
+before=$(served)
+pkill -9 -f -- "--keep-mounted --store $NSTORE"
+restarted() { [[ $(served) -gt $before ]]; }
+if wait_for 30 restarted; then ok "launchd restarts a killed NFS agent, which adopts the mount"; else bad "launchd restarts a killed NFS agent, which adopts the mount"; fi
+check "reads work at once under launchd, on the root" bash -c "[[ \$(cat '$NA/f') == nfs ]]"
+check "and on the attachment" bash -c "[[ \$(cat '$NP/dir/a') == att ]]"
+check "unmount points at uninstall-agent for an NFS agent" bash -c "'$B' unmount --mount '$NA' 2>&1 | grep -q 'uninstall-agent' && [[ \$(from '$NA') == 127.0.0.1:/ ]]"
+check "uninstall the NFS agent" bash -c "'$B' uninstall-agent --name '$NS' && ! /sbin/mount | grep -qE ' on ($NA|$NP/dir) \\('"
+wait_for 10 bash -c "! nfs_server" > /dev/null
+check "delete-store --backend nfs" bash -c "'$B' delete-store --backend nfs '$NS' && [[ ! -e '$NSTORE' ]]"
+check "delete-store of no NFS store fails" bash -c "! '$B' delete-store --backend nfs '$NS' 2>/dev/null"
+
 # Throwaway stores and registry
+"$B" delete-store "$AU" > /dev/null
 "$B" delete-store "$STORE" > /dev/null
 "$B" delete-store "$AS" > /dev/null
 "$B" delete-store "$(python3 -I -c "import json,os; print(json.load(open(os.path.expanduser('~/Library/Application Support/buildfs/$AS-attachments.json')))[0]['export'])")" > /dev/null
-rm -f "$HOME/Library/Logs/buildfs-$AS.log" "$HOME/Library/Application Support/buildfs/$STORE-attachments.json" "$HOME/Library/Application Support/buildfs/$AS-attachments.json"
+rm -f "$HOME/Library/Logs/buildfs-$NS.log" "$HOME/Library/Logs/buildfs-$NS-b.log" "$HOME/Library/Logs/buildfs-$AU.log" "$HOME/Library/Logs/buildfs-$AS.log" "$HOME/Library/Application Support/buildfs/$STORE-attachments.json" "$HOME/Library/Application Support/buildfs/$AS-attachments.json"
 echo "failures: $fails"
 exit $((fails > 0))

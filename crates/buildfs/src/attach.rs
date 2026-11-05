@@ -9,7 +9,8 @@
 //!
 //! On NFS that is a mount of the store subtree `/.buildfs/attach/<id>`, and
 //! the registry lives inside the filesystem (`/.buildfs/attachments.json`),
-//! so `buildfs mount` can restore every attachment at startup.
+//! so `buildfs mount` can restore every attachment at startup. The server reads
+//! it from the store rather than through the mount (see `load_from_store`).
 //!
 //! FSKit can't mount a subtree: each volume is one extension process with
 //! exclusive access to its store. So an attachment is a store of its own
@@ -23,6 +24,9 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+use buildfs_core::meta::ROOT_INO;
+use buildfs_core::vfs::Vfs;
 
 use crate::mounts::{self, Backend, Root, find_root_mount, mounted_from};
 
@@ -55,6 +59,26 @@ pub fn load(root: &Root) -> Vec<Attachment> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
+}
+
+/// The NFS registry, read by the server that owns the store. Reading it through
+/// the mount would never return under launchd: privacy rules block its `open`
+/// on a network volume, and the blocked open also wedges `umount`.
+pub fn load_from_store(vfs: &Vfs) -> Vec<Attachment> {
+    let read = || -> buildfs_core::vfs::Result<Vec<u8>> {
+        let dir = vfs.lookup(ROOT_INO, ".buildfs")?;
+        let ino = vfs.lookup(dir, "attachments.json")?;
+        let mut bytes = Vec::new();
+        loop {
+            let (chunk, eof) = vfs.read(ino, bytes.len() as u64, 1 << 20)?;
+            let done = eof || chunk.is_empty();
+            bytes.extend_from_slice(&chunk);
+            if done {
+                return Ok(bytes);
+            }
+        }
+    };
+    read().ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 fn save(root: &Root, list: &[Attachment]) -> anyhow::Result<()> {
@@ -297,7 +321,12 @@ pub fn print_list(mount: Option<&Path>) -> anyhow::Result<()> {
 /// Mounts every registered attachment (called by `buildfs mount` once the
 /// root is up). Never mounts over a non-empty directory.
 pub fn restore(root: &Root) {
-    for a in load(root) {
+    restore_list(root, load(root));
+}
+
+/// Mounts those of `list` that aren't mounted.
+pub fn restore_list(root: &Root, list: Vec<Attachment>) {
+    for a in list {
         if mounted_from(&a.path).is_some() {
             continue; // still mounted from before a restart: adopted
         }
@@ -327,6 +356,24 @@ pub fn restore(root: &Root) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_reads_the_registry_from_its_store() {
+        use buildfs_core::SetAttrs;
+        use buildfs_core::vfs::{Caller, NewNode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = Vfs::open(dir.path()).unwrap();
+        assert_eq!(load_from_store(&vfs), [], "no registry yet");
+
+        let list = vec![Attachment { path: "/p/node_modules".into(), export: "/.buildfs/attach/x".into() }];
+        let (me, attrs) = (Caller::root(), SetAttrs::default());
+        let (d, _) = vfs.create(&me, ROOT_INO, ".buildfs", NewNode::Dir, &attrs).unwrap();
+        let (f, _) = vfs.create(&me, d, "attachments.json", NewNode::File, &attrs).unwrap();
+        vfs.write_data(f, 0, &serde_json::to_vec_pretty(&list).unwrap()).unwrap();
+        assert_eq!(load_from_store(&vfs), list);
+        vfs.shutdown();
+    }
 
     #[test]
     fn export_ids_are_stable_and_readable() {

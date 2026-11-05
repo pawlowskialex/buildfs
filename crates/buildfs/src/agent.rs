@@ -89,14 +89,16 @@ fn schedule(kind: &Kind<'_>) -> &'static str {
     }
 }
 
-fn nfs_argv(exe: &Path, store: &Path, port: u16, args: &Tuning, mountpoint: &Path) -> Vec<String> {
+fn sync_arg(sync: crate::Sync) -> String {
+    match sync {
+        crate::Sync::Relaxed => "relaxed".into(),
+        crate::Sync::Strict => "strict".into(),
+    }
+}
+
+/// `mount` arguments for an NFS server on `store`, up to the mountpoint.
+pub(crate) fn nfs_server_args(store: &Path, port: u16, args: &Tuning) -> Vec<String> {
     let mut argv = vec![
-        exe.display().to_string(),
-        "mount".into(),
-        // launchd-spawned processes can't reliably unmount (the kernel
-        // unmount hangs or is refused), so the agent leaves the mount up;
-        // a restarted agent adopts it and `uninstall-agent` unmounts.
-        "--keep-mounted".into(),
         "--store".into(),
         store.display().to_string(),
         "--port".into(),
@@ -106,14 +108,24 @@ fn nfs_argv(exe: &Path, store: &Path, port: u16, args: &Tuning, mountpoint: &Pat
         "--compress-after".into(),
         args.compress_after.to_string(),
         "--sync".into(),
-        match args.sync {
-            crate::Sync::Relaxed => "relaxed".into(),
-            crate::Sync::Strict => "strict".into(),
-        },
+        sync_arg(args.sync),
     ];
     if let Some(w) = args.workers {
         argv.extend(["--workers".into(), w.to_string()]);
     }
+    argv
+}
+
+fn nfs_argv(exe: &Path, store: &Path, port: u16, args: &Tuning, mountpoint: &Path) -> Vec<String> {
+    let mut argv = vec![
+        exe.display().to_string(),
+        "mount".into(),
+        // launchd-spawned processes can't reliably unmount (the kernel
+        // unmount hangs or is refused), so the agent leaves the mount up;
+        // a restarted agent adopts it and `uninstall-agent` unmounts.
+        "--keep-mounted".into(),
+    ];
+    argv.extend(nfs_server_args(store, port, args));
     argv.push(mountpoint.display().to_string());
     argv
 }
@@ -165,6 +177,15 @@ fn plist_text(name: &str, argv: &[String], kind: &Kind<'_>, log: &Path) -> Strin
     )
 }
 
+/// The log of the agent or detached server called `name`.
+pub(crate) fn log_path(name: &str) -> anyhow::Result<PathBuf> {
+    let logs = home()?.join("Library/Logs");
+    std::fs::create_dir_all(&logs)?;
+    Ok(logs.join(format!("buildfs-{name}.log")))
+}
+
+/// Installs an agent. Its plist records the backend and the store explicitly,
+/// so that upgrading macOS doesn't switch stores underneath the user.
 pub fn install(kind: Kind<'_>, args: &Tuning, mountpoint: &Path, name: &str) -> anyhow::Result<()> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("agent name may only contain letters, digits, '-' and '_'");
@@ -172,9 +193,7 @@ pub fn install(kind: Kind<'_>, args: &Tuning, mountpoint: &Path, name: &str) -> 
     let exe = std::env::current_exe()?.canonicalize()?;
     let mountpoint = absolute(mountpoint)?;
     std::fs::create_dir_all(&mountpoint)?;
-    let logs = home()?.join("Library/Logs");
-    std::fs::create_dir_all(&logs)?;
-    let log = logs.join(format!("buildfs-{name}.log"));
+    let log = log_path(name)?;
     let (argv, what) = match kind {
         Kind::Nfs { store, port } => {
             let store = absolute(store)?;
@@ -227,6 +246,19 @@ fn stop_agent(name: &str) {
         .arg("bootout")
         .arg(format!("gui/{}/{}", uid(), label(name)))
         .status();
+}
+
+/// The name of the agent that serves `mountpoint`, if any.
+pub fn agent_for_mountpoint(mountpoint: &Path) -> Option<String> {
+    std::fs::read_dir(home().ok()?.join("Library/LaunchAgents"))
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|e| {
+            let file = e.file_name();
+            let name = file.to_str()?.strip_prefix("dev.buildfs.")?.strip_suffix(".plist")?.to_owned();
+            let args = plist_args(&std::fs::read_to_string(e.path()).ok()?)?;
+            (args.last().map(Path::new) == Some(mountpoint)).then_some(name)
+        })
 }
 
 /// Whether an FSKit agent is installed for store `name` (`buildfs unmount`
@@ -314,5 +346,16 @@ mod tests {
         assert!(!text.contains("StartInterval"));
         assert_eq!(plist_args(&text).unwrap(), argv);
         assert!(argv.iter().any(|a| a == "--keep-mounted"));
+    }
+
+    /// An OS upgrade must not change what an installed agent mounts, so its
+    /// arguments can't leave the backend to be chosen when it runs.
+    #[test]
+    fn agents_record_their_backend() {
+        let fskit = fskit_argv(Path::new("/b"), "x", &tuning(), Path::new("/m"));
+        assert!(fskit.iter().any(|a| a == "--fskit"));
+        let nfs = nfs_argv(Path::new("/b"), Path::new("/s"), 20491, &tuning(), Path::new("/m"));
+        assert!(nfs.windows(2).any(|w| w[0] == "--store" && w[1] == "/s"));
+        assert!(nfs.windows(2).any(|w| w[0] == "--port" && w[1] == "20491"));
     }
 }

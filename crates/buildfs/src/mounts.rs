@@ -58,6 +58,17 @@ pub fn fskit_store(from: &str) -> Option<&str> {
     from.strip_prefix("buildfs://").map(|s| s.trim_end_matches('/'))
 }
 
+/// What to do about a module that is installed but switched off.
+const FSKIT_DISABLED_HELP: &str = "the buildfs FSKit module is installed but disabled. Turn it on in System Settings > General > \
+     Login Items & Extensions > File System Extensions > buildfs \
+     (open \"x-apple.systempreferences:com.apple.LoginItems-Settings.extension\"), or use \
+     --backend nfs, which keeps a separate store";
+
+/// Whether `mount`'s output says the module is switched off.
+fn says_module_disabled(output: &str) -> bool {
+    output.contains("is disabled!")
+}
+
 /// Mounts FSKit store `store` at `dir`. `fskitd` starts the extension;
 /// no process of ours stays behind. Retries a few times: the system may
 /// still be starting up (login) or registering the module (reinstall).
@@ -68,18 +79,24 @@ pub fn mount_fskit(store: &str, dir: &Path, extra: &[String]) -> anyhow::Result<
         opts.push_str(e);
     }
     let url = fskit_url(store);
+    let mut output = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
-        let status = Command::new("/sbin/mount")
+        let out = Command::new("/sbin/mount")
             .args(["-F", "-t", "buildfs", "-o", &opts, &url])
             .arg(dir)
-            .status()?;
-        if status.success() {
+            .output()?;
+        if out.status.success() {
             return Ok(());
         }
+        output = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if says_module_disabled(&output) {
+            bail!(FSKIT_DISABLED_HELP);
+        }
     }
+    eprint!("{output}");
     bail!(
         "mounting {url} on {} failed. Is the module installed (fskit/install.sh) and enabled \
          (System Settings > General > Login Items & Extensions > File System Extensions)?",
@@ -163,10 +180,14 @@ pub struct Root {
     pub backend: Backend,
 }
 
+/// Whether `from` is the root of a buildfs NFS mount.
+pub fn is_nfs_root(from: &str) -> bool {
+    from == "127.0.0.1:/" || from == "localhost:/"
+}
+
 /// Whether `from` is a root rather than an attachment or something else.
 fn is_root(from: &str) -> bool {
-    from == "127.0.0.1:/"
-        || from == "localhost:/"
+    is_nfs_root(from)
         || fskit_store(from).is_some_and(|s| !s.starts_with(FSKIT_ATTACH_PREFIX))
 }
 
@@ -234,6 +255,31 @@ pub fn mounted_from(path: &std::path::Path) -> Option<String> {
     })
 }
 
+/// Makes the kernel's NFS client notice that its server restarted, and waits
+/// until it has recovered. Otherwise the first user of the mount does that, and
+/// the client fails that operation with EIO, though the server answers every
+/// request. It takes `statfs` because launchd jobs can't `open` on the volume.
+pub fn wake_nfs_client(dir: &Path) {
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    // SAFETY: `path` is NUL-terminated and `st` is a valid out pointer.
+    let rc = unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        libc::statfs(path.as_ptr(), &mut st)
+    };
+    tracing::debug!("statfs {} after a server restart: {rc}", dir.display());
+}
+
+/// The attachments mounted from the NFS server on `port`.
+pub fn nfs_attachments_on_port(port: u16) -> Vec<PathBuf> {
+    all_mounts()
+        .into_iter()
+        .filter(|(on, from)| from.starts_with("127.0.0.1:/.buildfs/attach/") && nfs_mount_port(on) == Some(port))
+        .map(|(on, _)| on)
+        .collect()
+}
+
 /// Server port of an NFS mount, from `nfsstat -m` (kernel mount info only;
 /// never contacts the server).
 pub fn nfs_mount_port(mountpoint: &std::path::Path) -> Option<u16> {
@@ -260,6 +306,16 @@ mod tests {
         for bad in ["", "-x", "Upper", "a_b", "a.b", "a/b", &"x".repeat(65)] {
             assert!(validate_store_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn disabled_module_is_recognized() {
+        // As printed by mount(8) on macOS 27.2.
+        assert!(says_module_disabled(
+            "Module com.pawlowskialex.buildfs.fsmodule is disabled!\nmount: Unable to invoke task\n"
+        ));
+        // The module is merely not registered yet: worth retrying.
+        assert!(!says_module_disabled("mount: File system named buildfs not found\n"));
     }
 
     #[test]
