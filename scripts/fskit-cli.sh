@@ -65,6 +65,27 @@ check "unmount takes attachments along" bash -c "'$B' unmount --mount '$M' && ! 
 check "mount restores attachments" bash -c "'$B' mount --fskit --name '$STORE' '$M' && /sbin/mount | grep -q ' on $P/empty (' && /sbin/mount | grep -q ' on $P/full ('"
 check "data survived" bash -c "[[ \$(cat '$P/empty/x') == x && \$(cat '$M/f') == hi && \$(xattr -p user.k '$P/full/sub/a') == v ]]"
 
+# Shared chunk pool: attachments with the same content share chunk files
+mkdir -p "$P/same1" "$P/same2"
+"$B" attach "$P/same1" "$P/same2" > /dev/null
+python3 -I -c "
+import random, sys
+random.seed(7)
+words = [random.randbytes(random.randint(3, 12)) for _ in range(4000)]
+sys.stdout.buffer.write(b' '.join(random.choice(words) for _ in range(600000)))" > "$T/payload"
+for d in same1 same2; do cp "$T/payload" "$P/$d/data"; done
+python3 -I -c 'import time; time.sleep(24)'   # compress-after is 15 s
+since=$(date "+%Y-%m-%d %H:%M:%S")
+"$B" unmount --mount "$M" > /dev/null
+python3 -I -c 'import time; time.sleep(1)'
+pooled=$(/usr/bin/log show --start "$since" --predicate 'subsystem == "com.pawlowskialex.buildfs.fsmodule" AND eventMessage BEGINSWITH "closed store att-proj-same"' 2>/dev/null |
+  grep -oE "[0-9]+ from the shared pool" | cut -d' ' -f1 | sort -n | tail -1)
+if [[ ${pooled:-0} -gt 0 ]]; then ok "one attachment took $pooled chunks from the pool"; else bad "attachments share chunks" "pooled=${pooled:-none}"; fi
+"$B" mount --fskit --name "$STORE" "$M" > /dev/null
+check "shared content reads back in both" bash -c "cmp '$T/payload' '$P/same1/data' && cmp '$T/payload' '$P/same2/data'"
+check "detaching one leaves the other intact" bash -c "'$B' detach '$P/same1' > /dev/null && cmp '$T/payload' '$P/same2/data'"
+check "detach the other" bash -c "'$B' detach '$P/same2' > /dev/null"
+
 # Detach
 check "detach --keep" "$B" detach --keep "$P/full"
 check "kept contents are local" bash -c "! /sbin/mount | grep -q ' on $P/full (' && cd '$P/full/sub' && [[ \$(cat a) == payload && \$(/usr/bin/stat -f %l a) == 2 && \$(xattr -p user.k a) == v ]]"

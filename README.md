@@ -11,7 +11,7 @@ There are two front ends over the same core:
 | Server process | none (`fskitd` runs the module) | yes |
 | FIFOs, sockets, device nodes | no | yes |
 | `--sync strict` | no | yes |
-| Attachments share dedup with the root | no | yes |
+| Attachments share dedup with the root | large chunks only (shared pool) | yes |
 
 ## Quick start: FSKit
 
@@ -44,7 +44,8 @@ buildfs uninstall-agent                    # unmounts and removes the agent
 
 `--name <store>` selects another store. Stores live in the module's sandbox
 container, which nothing else can read: `buildfs delete-store <name>` deletes
-one, and the store's size is logged whenever it closes
+one (freeing what no other store shares), and its size and the total for all
+stores are logged whenever it closes
 (`log show --predicate 'subsystem == "com.pawlowskialex.buildfs.fsmodule"' | grep "closed store"`).
 
 Mount with `mount -F -t buildfs -o owners,nobrowse buildfs://<store> <dir>` if
@@ -113,8 +114,18 @@ and restored when buildfs mounts; `buildfs attachments` lists them, and
 
 On NFS an attachment is a subtree of the store. FSKit can't mount a subtree
 (each volume is a process with exclusive access to its store), so there each
-attachment is **a store of its own, with no dedup against the root or other
-attachments**, and its own extension process (about 11 MB when idle).
+attachment is a store of its own, with its own extension process (about 11 MB
+when idle). All FSKit stores share their compressed chunks through a pool (see
+Design), which pays off when projects have the same dependencies. For
+`node_modules`:
+
+| | separate | shared pool |
+|---|---|---|
+| same dependencies, 3 projects, plus a Vite app | 370 MB | **201 MB** |
+| unrelated stacks (estimate from one store holding them) | 144–173 MB | 145–163 MB |
+
+Files that compress to 3 KiB or less and chunks of 2 KiB or less live in each
+store's own database, and aren't shared.
 
 **What fits.** Compiler outputs (Rust, Xcode, Go, Swift, C++) are few,
 large, write-once files: ideal. `node_modules` shrinks well too (a Next.js
@@ -143,10 +154,10 @@ Space (the core is the same on both front ends):
 
 | | APFS | buildfs |
 |---|---|---|
-| this workspace, one target dir | 928 MB | **254 MB** (3.65x, FSKit) |
+| this workspace, one target dir | 931 MB | **259 MB** (3.60x, FSKit) |
 | two target dirs, same deps | 1.1 GB | **184 MB** (6.1x: 3.06x zstd, 2x dedup; NFS, older build) |
 
-All 2962 artifacts of the workspace build were byte- and metadata-identical
+All 2964 artifacts of the workspace build were byte- and metadata-identical
 after compression and remount on FSKit
 (`scripts/fskit-integrity.sh`), as were all 4680 of the two-target run on NFS.
 Timings vary ±20% with machine load.
@@ -210,6 +221,18 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   and deleted after its last reference is dropped. Deletion re-checks the
   count under a lock that compaction also holds while committing, so a
   delete racing a new reference can only make that compaction retry.
+- **Shared pool (FSKit).** Stores can't share a database, but they can share
+  files. A store publishes each chunk file as a hard link in a pool; another
+  store needing that chunk verifies the pool's copy against the bytes it has,
+  and links it into its own `chunks/` instead of compressing it. The file's
+  link count is the reference count across stores, so they need no
+  coordination. A store only ever uses its own link, so any crash or race ends
+  in a duplicate or an orphan, never lost data. Orphans are swept in the
+  background at startup, and when a store is deleted. `-o nopool` opts out.
+  Sharing is forward-looking: chunks two stores already hold separately stay
+  separate. Damage to a shared chunk file (say, after power loss, since chunk
+  files aren't fsynced) affects every store using it, as it already did for
+  every file using the chunk within a store.
 - **Metadata** lives in redb. Inode numbers and readdir cookies come from
   monotonic counters and are never reused, which lets filehandles embed the
   inode number and lets directory listings be resumed while the directory

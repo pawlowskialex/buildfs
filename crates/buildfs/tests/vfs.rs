@@ -812,3 +812,275 @@ fn concurrent_dedup_and_deletion_never_lose_chunks() {
         assert_eq!(read_all(&vfs, f), data, "{name}");
     }
 }
+
+// ----- shared chunk pool ----------------------------------------------------
+
+fn pooled(store: &std::path::Path, pool: &std::path::Path, level: i32) -> std::sync::Arc<Vfs> {
+    Vfs::open_with(
+        store,
+        Options {
+            chunk_pool: Some(pool.to_path_buf()),
+            level,
+            ..manual_compaction()
+        },
+    )
+    .unwrap()
+}
+
+fn put_file(vfs: &Vfs, name: &str, data: &[u8]) -> u64 {
+    let ino = mkfile(vfs, ROOT_INO, name);
+    assert_eq!(vfs.write_data(ino, 0, data).unwrap() as usize, data.len());
+    ino
+}
+
+/// Regular files under `dir`, as (inode, link count).
+fn files_under(dir: &std::path::Path) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            let m = std::fs::metadata(&p).unwrap();
+            out.push((m.ino(), m.nlink()));
+        }
+    }
+    out
+}
+
+#[test]
+fn pool_shares_chunks_between_stores() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let data = artifact(2_000_000);
+    let (a, b) = (pooled(&tmp.path().join("a"), &pool, 3), pooled(&tmp.path().join("b"), &pool, 3));
+    let (ia, ib) = (put_file(&a, "x", &data), put_file(&b, "y", &data));
+    assert!(a.compact(ia).unwrap());
+    assert_eq!(a.compress_stats().pool_chunks, 0, "first store compresses");
+    assert!(b.compact(ib).unwrap());
+    let st = b.compress_stats();
+    assert_eq!(st.pool_chunks as usize, data.len().div_ceil(128 * 1024));
+    assert_eq!(st.pool_bytes as usize, data.len());
+
+    // One inode per chunk, shared by both stores and the pool.
+    let in_pool = files_under(&pool);
+    assert_eq!(in_pool.len(), st.pool_chunks as usize);
+    assert!(in_pool.iter().all(|&(_, links)| links == 3), "{in_pool:?}");
+    let mut own: Vec<u64> = files_under(&tmp.path().join("b/chunks")).iter().map(|f| f.0).collect();
+    let mut shared: Vec<u64> = in_pool.iter().map(|f| f.0).collect();
+    own.sort_unstable();
+    shared.sort_unstable();
+    assert_eq!(own, shared);
+
+    assert_eq!(read_all(&a, ia), data);
+    assert_eq!(read_all(&b, ib), data);
+
+    // Removing it from one store leaves the other intact; removing it from
+    // both frees everything.
+    a.remove(ROOT_INO, "x").unwrap();
+    assert_eq!(read_all(&b, ib), data);
+    assert!(files_under(&pool).iter().all(|&(_, links)| links == 2));
+    b.remove(ROOT_INO, "y").unwrap();
+    assert!(files_under(&pool).is_empty());
+}
+
+#[test]
+fn pool_works_across_compression_levels_and_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let data = artifact(1_000_000);
+    let (sa, sb) = (tmp.path().join("a"), tmp.path().join("b"));
+    let a = pooled(&sa, &pool, 19);
+    let b = pooled(&sb, &pool, 1);
+    let (ia, ib) = (put_file(&a, "x", &data), put_file(&b, "y", &data));
+    assert!(a.compact(ia).unwrap());
+    assert!(b.compact(ib).unwrap());
+    assert!(b.compress_stats().pool_chunks > 0);
+    a.shutdown();
+    b.shutdown();
+    drop((a, b));
+    // Both reopen: nothing is lost, and nothing in use is swept.
+    let (a, b) = (pooled(&sa, &pool, 3), pooled(&sb, &pool, 3));
+    assert_eq!(read_all(&a, ia), data);
+    assert_eq!(read_all(&b, ib), data);
+    assert!(!files_under(&pool).is_empty());
+    assert!(files_under(&pool).iter().all(|&(_, links)| links == 3));
+}
+
+#[test]
+fn pool_is_filled_from_stores_that_predate_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let data = artifact(1_000_000);
+    let sa = tmp.path().join("a");
+    let a = Vfs::open_with(&sa, manual_compaction()).unwrap();
+    let ia = put_file(&a, "x", &data);
+    assert!(a.compact(ia).unwrap());
+    a.shutdown();
+    drop(a);
+    assert!(files_under(&pool).is_empty());
+    // Opening it with a pool publishes what it has (in the background).
+    let a = pooled(&sa, &pool, 3);
+    for _ in 0..500 {
+        if files_under(&pool).iter().filter(|f| f.1 == 2).count() == 8 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(files_under(&pool).len(), 8, "1 MB is 8 chunks");
+    let b = pooled(&tmp.path().join("b"), &pool, 3);
+    let ib = put_file(&b, "y", &data);
+    assert!(b.compact(ib).unwrap());
+    assert!(b.compress_stats().pool_chunks > 0);
+    assert_eq!(read_all(&a, ia), data);
+    assert_eq!(read_all(&b, ib), data);
+}
+
+#[test]
+fn deleting_a_store_only_frees_what_it_alone_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let shared = artifact(1_000_000);
+    let mut only_a = artifact(1_000_000);
+    only_a.reverse();
+    let sa = tmp.path().join("a");
+    let (a, b) = (pooled(&sa, &pool, 3), pooled(&tmp.path().join("b"), &pool, 3));
+    let (i1, i2, ib) = (put_file(&a, "s", &shared), put_file(&a, "o", &only_a), put_file(&b, "s", &shared));
+    assert!(a.compact(i1).unwrap());
+    assert!(a.compact(i2).unwrap());
+    assert!(b.compact(ib).unwrap());
+    let before = files_under(&pool).len();
+    a.shutdown();
+    drop(a);
+    std::fs::remove_dir_all(&sa).unwrap();
+    let freed = Vfs::sweep_chunk_pool(&pool).unwrap();
+    assert!(freed > 0);
+    assert!(files_under(&pool).len() < before);
+    assert_eq!(read_all(&b, ib), shared);
+}
+
+#[test]
+fn pool_survives_losing_its_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let data = artifact(1_000_000);
+    let (a, b) = (pooled(&tmp.path().join("a"), &pool, 3), pooled(&tmp.path().join("b"), &pool, 3));
+    let (ia, ib) = (put_file(&a, "x", &data), put_file(&b, "y", &data));
+    assert!(a.compact(ia).unwrap());
+    assert!(b.compact(ib).unwrap());
+    // Stores don't depend on the pool at all.
+    std::fs::remove_dir_all(&pool).unwrap();
+    assert_eq!(read_all(&a, ia), data);
+    assert_eq!(read_all(&b, ib), data);
+    a.remove(ROOT_INO, "x").unwrap();
+    assert_eq!(read_all(&b, ib), data);
+    // It comes back in use: a new file compacts and reads fine.
+    let i2 = put_file(&b, "z", &artifact(500_000));
+    assert!(b.compact(i2).unwrap());
+    assert_eq!(read_all(&b, i2), artifact(500_000));
+}
+
+#[test]
+fn pool_stress_many_stores_compacting_and_deleting_the_same_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let stores: Vec<_> = (0..4)
+        .map(|i| pooled(&tmp.path().join(format!("s{i}")), &pool, 1 + i * 2))
+        .collect();
+    // A few distinct contents, so stores keep colliding on the same chunks.
+    let contents: Vec<Vec<u8>> = (0..3usize).map(|i| artifact(400_000 + i * 150_000)).collect();
+    std::thread::scope(|scope| {
+        for (t, vfs) in stores.iter().enumerate() {
+            let contents = &contents;
+            let pool = &pool;
+            scope.spawn(move || {
+                let mut live: Vec<(u64, String, usize)> = Vec::new();
+                for round in 0..40usize {
+                    let which = (t + round) % contents.len();
+                    let name = format!("f{round}");
+                    let ino = put_file(vfs, &name, &contents[which]);
+                    // A compaction may abort on a race; retrying must work.
+                    let mut done = false;
+                    for _ in 0..50 {
+                        if vfs.compact(ino).unwrap() {
+                            done = true;
+                            break;
+                        }
+                    }
+                    assert!(done, "compaction never succeeded");
+                    live.push((ino, name, which));
+                    if round % 3 == 2 {
+                        let (i, n, w) = live.remove(round % live.len());
+                        assert_eq!(read_all(vfs, i), contents[w]);
+                        vfs.remove(ROOT_INO, &n).unwrap();
+                    }
+                    if round % 7 == 0 {
+                        let _ = Vfs::sweep_chunk_pool(pool).unwrap();
+                    }
+                    for (i, _, w) in &live {
+                        assert_eq!(&read_all(vfs, *i), &contents[*w]);
+                    }
+                }
+                for (i, n, w) in live {
+                    assert_eq!(read_all(vfs, i), contents[w]);
+                    vfs.remove(ROOT_INO, &n).unwrap();
+                }
+            });
+        }
+    });
+    // Everything deleted: no chunk file left anywhere.
+    let _ = Vfs::sweep_chunk_pool(&pool).unwrap();
+    assert_eq!(files_under(&pool).len(), 0);
+    for i in 0..4 {
+        assert_eq!(files_under(&tmp.path().join(format!("s{i}/chunks"))).len(), 0);
+    }
+}
+
+#[test]
+fn crash_between_adopting_and_committing_leaves_nothing_behind() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = tmp.path().join("pool");
+    let data = artifact(1_000_000);
+    let (sa, sb) = (tmp.path().join("a"), tmp.path().join("b"));
+    let a = pooled(&sa, &pool, 3);
+    let b = pooled(&sb, &pool, 3);
+    let ia = put_file(&a, "x", &data);
+    assert!(a.compact(ia).unwrap());
+    b.shutdown();
+    drop(b);
+    // What a crash mid-adoption leaves in store b: links to the chunks with
+    // no reference to them in b's metadata.
+    let first_link = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for shard in std::fs::read_dir(dir).unwrap() {
+            let shard = shard.unwrap().path();
+            if shard.is_dir() {
+                out.extend(std::fs::read_dir(shard).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        out
+    };
+    let chunks = first_link(&pool);
+    assert_eq!(chunks.len(), 8);
+    for c in &chunks {
+        let name = c.file_name().unwrap().to_str().unwrap();
+        let dst = sb.join("chunks").join(&name[..2]);
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::hard_link(c, dst.join(name)).unwrap();
+    }
+    assert!(chunks.iter().all(|c| std::fs::metadata(c).unwrap().nlink() == 3));
+
+    // Reopening removes b's stray links and nothing else.
+    let b = pooled(&sb, &pool, 3);
+    assert_eq!(files_under(&sb.join("chunks")).len(), 0);
+    assert!(chunks.iter().all(|c| std::fs::metadata(c).unwrap().nlink() == 2));
+    assert_eq!(read_all(&a, ia), data);
+    // And it can adopt them properly afterwards.
+    let ib = put_file(&b, "y", &data);
+    assert!(b.compact(ib).unwrap());
+    assert_eq!(b.compress_stats().pool_chunks, 8);
+    assert_eq!(read_all(&b, ib), data);
+}

@@ -145,7 +145,7 @@ pub struct BfsCaller {
 
 /// Store options. Zero or negative fields mean "default".
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct BfsOptions {
     /// Compress files after this many ms without writes; 0 = default (15 s),
     /// negative = never compress in the background.
@@ -156,6 +156,21 @@ pub struct BfsOptions {
     pub zstd_level: i32,
     /// Decompressed-chunk cache size; 0 = default.
     pub cache_bytes: u64,
+    /// Directory for sharing chunk files with other stores, on the same file
+    /// system (NUL-terminated); null = don't share.
+    pub chunk_pool: *const c_char,
+}
+
+impl Default for BfsOptions {
+    fn default() -> Self {
+        Self {
+            compress_after_ms: 0,
+            compress_workers: 0,
+            zstd_level: 0,
+            cache_bytes: 0,
+            chunk_pool: std::ptr::null(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -187,6 +202,9 @@ pub struct BfsCompressStats {
     pub stored_bytes: u64,
     pub dedup_chunks: u64,
     pub dedup_bytes: u64,
+    /// Chunks (and their logical bytes) found in the shared pool.
+    pub pool_chunks: u64,
+    pub pool_bytes: u64,
 }
 
 /// Receives one log line (`msg` is not NUL-terminated).
@@ -584,6 +602,11 @@ pub unsafe extern "C" fn bfs_open(
         if o.cache_bytes > 0 {
             options.cache_bytes = usize::try_from(o.cache_bytes).unwrap_or(usize::MAX);
         }
+        if !o.chunk_pool.is_null() {
+            // SAFETY: guaranteed by the caller.
+            let pool = unsafe { CStr::from_ptr(o.chunk_pool) }.to_str().map_err(|_| libc::EILSEQ)?;
+            options.chunk_pool = Some(Path::new(pool).to_path_buf());
+        }
         match buildfs::raise_fd_limit() {
             Ok(n) => tracing::info!("open file limit: {n}"),
             Err(e) => tracing::warn!("could not raise the open file limit: {e}"),
@@ -596,6 +619,32 @@ pub unsafe extern "C" fn bfs_open(
         // SAFETY: `out` checked non-null above; guaranteed valid by the caller.
         unsafe { *out = Box::into_raw(Box::new(BfsVfs { vfs })) };
         Ok(())
+    })
+}
+
+/// Removes chunks no store uses from a shared pool, freeing their disk space.
+/// Safe while stores are open; call after deleting a store's directory.
+///
+/// # Safety
+/// `pool` is a NUL-terminated path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bfs_sweep_chunk_pool(pool: *const c_char) -> i32 {
+    guard(|| {
+        if pool.is_null() {
+            return Err(libc::EINVAL);
+        }
+        // SAFETY: guaranteed by the caller.
+        let pool = unsafe { CStr::from_ptr(pool) }.to_str().map_err(|_| libc::EILSEQ)?;
+        match Vfs::sweep_chunk_pool(Path::new(pool)) {
+            Ok(n) => {
+                tracing::info!("removed {n} unused chunks from the shared pool");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("sweeping the chunk pool failed: {e:#}");
+                Err(libc::EIO)
+            }
+        }
     })
 }
 
@@ -1191,6 +1240,8 @@ pub unsafe extern "C" fn bfs_compress_stats(v: *const BfsVfs, out: *mut BfsCompr
             stored_bytes: s.stored_bytes,
             dedup_chunks: s.dedup_chunks,
             dedup_bytes: s.dedup_bytes,
+            pool_chunks: s.pool_chunks,
+            pool_bytes: s.pool_bytes,
         };
         // SAFETY: guaranteed by the caller.
         unsafe { put(out, c) };

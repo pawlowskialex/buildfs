@@ -98,11 +98,23 @@ pub fn discard_fskit_store(store: &str) -> anyhow::Result<()> {
     r
 }
 
-/// Unmounts `dir`, forcing if a plain unmount fails.
+/// Unmounts `dir`, forcing only if it stays busy for a while: something often
+/// holds a volume for a moment (seen right after running a new binary from
+/// it, probably macOS scanning it), and forcing can lose unwritten data.
 pub fn unmount(dir: &Path) -> anyhow::Result<()> {
-    if Command::new("/sbin/umount").arg(dir).status()?.success() {
-        return Ok(());
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let quiet = Command::new("/sbin/umount")
+            .arg(dir)
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if quiet.success() {
+            return Ok(());
+        }
     }
+    tracing::warn!("{} stays busy; forcing the unmount", dir.display());
     if Command::new("/sbin/umount").arg("-f").arg(dir).status()?.success() {
         return Ok(());
     }

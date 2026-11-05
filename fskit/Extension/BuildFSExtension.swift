@@ -219,9 +219,10 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
         super.init(volumeID: FSVolume.Identifier(uuid: volumeUUID(storeName)), volumeName: FSFileName(string: storeName))
     }
 
-    private var storeDir: String {
-        (NSHomeDirectory() as NSString).appendingPathComponent("stores/\(storeName)")
-    }
+    private var storesRoot: String { (NSHomeDirectory() as NSString).appendingPathComponent("stores") }
+    private var storeDir: String { (storesRoot as NSString).appendingPathComponent(storeName) }
+    /// Chunk files shared by every store (all stores share this container).
+    private var chunkPool: String { (NSHomeDirectory() as NSString).appendingPathComponent("chunk-pool") }
 
     /// Closes the store (idempotent), logging what it holds.
     func close() {
@@ -231,25 +232,31 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
         _ = bfs_compress_stats(h, &st)
         bfs_close(h)
         log.notice("""
-            closed store \(self.storeName, privacy: .public): \(Self.diskUsage(self.storeDir)) bytes on disk; \
+            closed store \(self.storeName, privacy: .public): \(Self.diskUsage([self.storeDir])) bytes on disk \
+            (all stores together: \(Self.diskUsage([self.storesRoot, self.chunkPool]))); \
             this session compacted \(st.compacted) files (\(st.logical_bytes) -> \(st.stored_bytes) bytes, \
-            \(st.dedup_chunks) chunks deduplicated)
+            \(st.dedup_chunks) chunks deduplicated, \(st.pool_chunks) from the shared pool)
             """)
         if discardOnClose {
             try? FileManager.default.removeItem(atPath: storeDir)
+            _ = chunkPool.withCString { bfs_sweep_chunk_pool($0) }
             log.notice("discarded store \(self.storeName, privacy: .public)")
         }
     }
 
-    /// Allocated bytes under `dir` (what `du` reports). The store lives in
-    /// the sandbox container, which other apps can't read.
-    static func diskUsage(_ dir: String) -> UInt64 {
-        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .isRegularFileKey]
-        guard let e = FileManager.default.enumerator(at: URL(fileURLWithPath: dir), includingPropertiesForKeys: keys) else { return 0 }
+    /// Allocated bytes under `dirs` (what `du` reports), counting hard links
+    /// once. Stores live in the sandbox container, which other apps can't read.
+    static func diskUsage(_ dirs: [String]) -> UInt64 {
+        var seen = Set<UInt64>()
         var total: UInt64 = 0
-        for case let url as URL in e {
-            if let r = try? url.resourceValues(forKeys: Set(keys)), r.isRegularFile == true {
-                total += UInt64(r.totalFileAllocatedSize ?? 0)
+        for dir in dirs {
+            guard let e = FileManager.default.enumerator(atPath: dir) else { continue }
+            for case let rel as String in e {
+                var st = stat()
+                if lstat((dir as NSString).appendingPathComponent(rel), &st) == 0,
+                   st.st_mode & S_IFMT == S_IFREG, seen.insert(st.st_ino).inserted {
+                    total += UInt64(st.st_blocks) * 512
+                }
             }
         }
         return total
@@ -406,7 +413,14 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
         // Seconds without writes before compressing; 0 = never.
         if let n = value("compress_after") { opts.compress_after_ms = n == 0 ? -1 : Int64(n) * 1000 }
         var h: OpaquePointer?
-        let rc = dir.withCString { bfs_open($0, &opts, &h) }
+        // `nopool`: keep this store's chunks to itself.
+        let pool = mountOpts.contains("nopool") ? "" : chunkPool
+        let rc = dir.withCString { d in
+            pool.withCString { p in
+                if !pool.isEmpty { opts.chunk_pool = p }
+                return bfs_open(d, &opts, &h)
+            }
+        }
         guard rc == 0, let h else {
             log.error("activateVolume: opening \(dir, privacy: .public) failed: \(rc)")
             return reply(nil, fsError(rc))

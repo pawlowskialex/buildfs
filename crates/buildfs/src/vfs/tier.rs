@@ -11,8 +11,9 @@
 //! - deleting a chunk file happens under `chunk_lock`, after re-checking
 //!   (in a fresh read transaction) that no reference exists;
 //! - a compaction commits under `chunk_lock` too, and when it creates the
-//!   first reference to a chunk it verifies the file still exists, aborting
-//!   (to be retried later) if a deletion won the race.
+//!   first reference to a chunk it verifies the file still exists with the
+//!   expected length, aborting (to be retried later) if a deletion or a
+//!   concurrent compaction won the race.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,8 @@ enum Planned {
     Existing,
     /// New, small: bytes go into `chunkdata` inside the transaction.
     Small(Encoded),
-    /// New, large: file already written; record its stored size.
+    /// New to this store, large: file already there (written, or linked from
+    /// the shared pool); record its stored size.
     Large { stored_len: u32, raw: bool },
 }
 
@@ -320,6 +322,7 @@ impl Vfs {
         let count = size.div_ceil(u64::from(CHUNK_SIZE)) as usize;
         let mut plan: Vec<(Hash, Planned)> = Vec::with_capacity(count);
         let mut new_files: Vec<Hash> = Vec::new();
+        let (mut pool_chunks, mut pool_bytes) = (0u64, 0u64);
         for i in 0..count {
             let off = i as u64 * u64::from(CHUNK_SIZE);
             let len = (size - off).min(u64::from(CHUNK_SIZE)) as usize;
@@ -329,11 +332,19 @@ impl Vfs {
                 plan.push((h, Planned::Existing));
                 continue;
             }
+            if let Some((stored_len, is_raw)) = self.chunks.adopt(&h, &raw) {
+                pool_chunks += 1;
+                pool_bytes += raw.len() as u64;
+                new_files.push(h);
+                plan.push((h, Planned::Large { stored_len, raw: is_raw }));
+                continue;
+            }
             let enc = chunks::encode(&mut compressor, &raw).map_err(io_err)?;
             if enc.bytes.len() <= SMALL_CHUNK_MAX {
                 plan.push((h, Planned::Small(enc)));
             } else {
                 let _ = self.chunks.write_file(&h, &enc.bytes).map_err(io_err)?;
+                self.chunks.publish(&h);
                 new_files.push(h);
                 plan.push((
                     h,
@@ -373,7 +384,7 @@ impl Vfs {
                             disk += enc.bytes.len() as u64;
                         }
                         Planned::Large { stored_len, raw } => {
-                            if !self.chunks.file_exists(h) {
+                            if self.chunks.file_len(h) != Some(u64::from(*stored_len)) {
                                 return Ok(None);
                             }
                             w.chunk_create(h, *stored_len, *raw, None)?;
@@ -410,6 +421,9 @@ impl Vfs {
         match outcome {
             Ok(Some(disk)) => {
                 self.record(true, false, size, disk, dedup_chunks, dedup_bytes);
+                let mut st = self.stats.lock();
+                st.pool_chunks += pool_chunks;
+                st.pool_bytes += pool_bytes;
                 Ok(true)
             }
             Ok(None) => {

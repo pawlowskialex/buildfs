@@ -7,6 +7,22 @@
 //! small chunks live in redb (see `vfs.rs`); chunks above
 //! [`SMALL_CHUNK_MAX`] are files `chunks/<hh>/<hash>` written once via
 //! rename and deleted when their count drops to zero.
+//!
+//! ## Shared pool
+//!
+//! Stores can't share a metadata database (redb allows one process), but they
+//! can share chunk files. With a pool directory on the same file system, a
+//! store publishes each chunk file as a hard link `<pool>/<hh>/<hash>`, and
+//! another store needing that chunk links it into its own `chunks/` instead
+//! of compressing it again. The file's link count is the reference count
+//! across stores, so no coordination is needed.
+//!
+//! **A store only ever uses its own link.** The pool is an index for finding
+//! chunks, so anything that happens to a pool entry costs at most a duplicate
+//! or an orphan, never data. Orphans (link count 1) are swept at startup and
+//! when a store is deleted. Entries are verified against the chunk's bytes
+//! before being adopted, so damage (power loss; chunk files aren't fsynced)
+//! doesn't spread to another store through the pool.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -120,9 +136,51 @@ impl Cache {
     }
 }
 
+/// Whether `stored` is `data`, raw or compressed; `Some(raw)` if so.
+fn verify_stored(stored: &[u8], data: &[u8]) -> Option<bool> {
+    if stored == data {
+        return Some(true);
+    }
+    match decode(stored.to_vec(), false, data.len()) {
+        Ok(d) if d == data => Some(false),
+        _ => None,
+    }
+}
+
+fn pool_entry(pool: &Path, h: &Hash) -> PathBuf {
+    let name = hex(h);
+    pool.join(&name[..2]).join(name)
+}
+
+/// Removes pool entries no store links to any more. Safe at any time: a
+/// store that is linked has link count 2 or more, and one that loses a race
+/// with this simply writes its own copy.
+pub fn sweep_pool(pool: &Path) -> io::Result<usize> {
+    let mut removed = 0;
+    let shards = match std::fs::read_dir(pool) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for shard in shards {
+        let shard = shard?;
+        if !shard.file_type()?.is_dir() {
+            continue;
+        }
+        for e in std::fs::read_dir(shard.path())? {
+            let e = e?;
+            if e.metadata().is_ok_and(|m| m.nlink() == 1) && std::fs::remove_file(e.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 pub struct ChunkStore {
     root: PathBuf,
     cache: Mutex<Cache>,
+    pool: Option<PathBuf>,
 }
 
 impl ChunkStore {
@@ -140,7 +198,76 @@ impl ChunkStore {
                 bytes: 0,
                 max_bytes: cache_bytes,
             }),
+            pool: None,
         })
+    }
+
+    /// Shares chunk files with other stores through `pool` (see the module
+    /// docs). It must be on the same file system as the store.
+    pub fn with_pool(mut self, pool: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir_all(&pool)?;
+        self.pool = Some(pool);
+        Ok(self)
+    }
+
+    pub fn pool(&self) -> Option<&Path> {
+        self.pool.as_deref()
+    }
+
+    /// Finds `data` as an existing chunk file: our own (another compaction
+    /// may have just written it) or, via a new hard link, the pool's.
+    /// Returns its stored length and whether it's raw. `None`: compress it.
+    pub fn adopt(&self, h: &Hash, data: &[u8]) -> Option<(u32, bool)> {
+        let pool = self.pool.as_ref()?;
+        let check = |p: &Path| -> Option<(u32, bool)> {
+            let stored = std::fs::read(p).ok()?;
+            let raw = verify_stored(&stored, data)?;
+            Some((u32::try_from(stored.len()).ok()?, raw))
+        };
+        let own = self.path(h);
+        if own.exists() {
+            return check(&own);
+        }
+        let entry = pool_entry(pool, h);
+        let Some(found) = check(&entry) else {
+            if entry.exists() {
+                // Damaged. Other stores still have their own links, so
+                // dropping the name is safe, and lets a good copy replace it.
+                tracing::warn!("removing damaged pool chunk {}", hex(h));
+                let _ = std::fs::remove_file(&entry);
+            }
+            return None;
+        };
+        if let Some(parent) = own.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        match std::fs::hard_link(&entry, &own) {
+            Ok(()) => Some(found),
+            // Written meanwhile by another compaction here: use that.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => check(&own),
+            // Removed meanwhile (or anything else): the pool is best effort.
+            Err(_) => None,
+        }
+    }
+
+    /// Offers our chunk file to other stores (best effort).
+    pub fn publish(&self, h: &Hash) {
+        let Some(pool) = &self.pool else { return };
+        let entry = pool_entry(pool, h);
+        if let Some(parent) = entry.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+        {
+            let _ = std::fs::hard_link(self.path(h), entry);
+        }
+    }
+
+    /// Our link to `h` is gone: drop the pool entry if nobody else has one.
+    fn pool_release(&self, h: &Hash) {
+        let Some(pool) = &self.pool else { return };
+        let entry = pool_entry(pool, h);
+        if std::fs::metadata(&entry).is_ok_and(|m| m.nlink() == 1) {
+            let _ = std::fs::remove_file(entry);
+        }
     }
 
     pub fn path(&self, h: &Hash) -> PathBuf {
@@ -148,8 +275,9 @@ impl ChunkStore {
         self.root.join(&name[..2]).join(name)
     }
 
-    pub fn file_exists(&self, h: &Hash) -> bool {
-        self.path(h).exists()
+    /// Length of the chunk file, if it exists.
+    pub fn file_len(&self, h: &Hash) -> Option<u64> {
+        std::fs::metadata(self.path(h)).ok().map(|m| m.len())
     }
 
     /// Writes a large chunk file (idempotent: same hash, same content).
@@ -188,10 +316,12 @@ impl ChunkStore {
 
     pub fn remove_file(&self, h: &Hash) -> io::Result<()> {
         let _ = self.cache.lock().map.remove(h);
-        match std::fs::remove_file(self.path(h)) {
+        let r = match std::fs::remove_file(self.path(h)) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,
-        }
+        };
+        self.pool_release(h);
+        r
     }
 
     pub fn cached(&self, h: &Hash) -> Option<Arc<Vec<u8>>> {
@@ -261,5 +391,125 @@ mod tests {
         assert_eq!(s.list_files().unwrap(), vec![h]);
         s.remove_file(&h).unwrap();
         assert!(s.list_files().unwrap().is_empty());
+    }
+
+    fn pooled(dir: &Path, name: &str) -> ChunkStore {
+        ChunkStore::open(dir.join(name), 1 << 20)
+            .unwrap()
+            .with_pool(dir.join("pool"))
+            .unwrap()
+    }
+
+    fn compressed(data: &[u8], level: i32) -> Encoded {
+        encode(&mut zstd::bulk::Compressor::new(level).unwrap(), data).unwrap()
+    }
+
+    #[test]
+    fn pool_shares_files_and_counts_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (pooled(tmp.path(), "a"), pooled(tmp.path(), "b"));
+        let data = b"shared chunk contents ".repeat(500);
+        let h = hash(&data);
+        assert_eq!(b.adopt(&h, &data), None, "nothing published yet");
+        let enc = compressed(&data, 3);
+        let _ = a.write_file(&h, &enc.bytes).unwrap();
+        a.publish(&h);
+        assert_eq!(b.adopt(&h, &data), Some((enc.bytes.len() as u32, false)));
+        let ino = |s: &ChunkStore| std::fs::metadata(s.path(&h)).unwrap().ino();
+        assert_eq!(ino(&a), ino(&b));
+        assert_eq!(std::fs::metadata(a.path(&h)).unwrap().nlink(), 3);
+        // A store leaving doesn't touch the others, and the last one out
+        // takes the pool entry along.
+        a.remove_file(&h).unwrap();
+        assert_eq!(b.read_file(&h, enc.bytes.len()).unwrap(), enc.bytes);
+        assert!(pool_entry(&tmp.path().join("pool"), &h).exists());
+        b.remove_file(&h).unwrap();
+        assert!(!pool_entry(&tmp.path().join("pool"), &h).exists());
+    }
+
+    #[test]
+    fn pool_detects_raw_chunks_and_foreign_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (pooled(tmp.path(), "a"), pooled(tmp.path(), "b"));
+        // Raw: incompressible, stored as is.
+        let mut x = 0x2545_f491u32;
+        let noise: Vec<u8> = (0..8192)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let h = hash(&noise);
+        let _ = a.write_file(&h, &noise).unwrap();
+        a.publish(&h);
+        assert_eq!(b.adopt(&h, &noise), Some((noise.len() as u32, true)));
+        // Another store's compression level: its length, not ours.
+        let data: Vec<u8> = (0..64_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                b"abcdefgh"[(x % 8) as usize]
+            })
+            .collect();
+        let h = hash(&data);
+        let enc = compressed(&data, 19);
+        assert_ne!(enc.bytes.len(), compressed(&data, 1).bytes.len());
+        let _ = a.write_file(&h, &enc.bytes).unwrap();
+        a.publish(&h);
+        assert_eq!(b.adopt(&h, &data), Some((enc.bytes.len() as u32, false)));
+    }
+
+    #[test]
+    fn pool_rejects_and_removes_damaged_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (pooled(tmp.path(), "a"), pooled(tmp.path(), "b"));
+        let data = b"will be damaged ".repeat(1000);
+        let h = hash(&data);
+        let entry = pool_entry(&tmp.path().join("pool"), &h);
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        // Truncated, and wrong content under the right name.
+        for bad in [&b""[..], b"garbage", &compressed(b"other", 3).bytes] {
+            std::fs::write(&entry, bad).unwrap();
+            assert_eq!(b.adopt(&h, &data), None);
+            assert!(!entry.exists());
+            assert!(!b.path(&h).exists());
+        }
+        // A good copy can take its place.
+        let enc = compressed(&data, 3);
+        let _ = a.write_file(&h, &enc.bytes).unwrap();
+        a.publish(&h);
+        assert!(b.adopt(&h, &data).is_some());
+    }
+
+    #[test]
+    fn pool_sweep_removes_only_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = tmp.path().join("pool");
+        assert_eq!(sweep_pool(&pool).unwrap(), 0, "no pool yet");
+        let a = pooled(tmp.path(), "a");
+        let (keep, gone) = (hash(b"keep"), hash(b"gone"));
+        for h in [keep, gone] {
+            let _ = a.write_file(&h, b"x").unwrap();
+            a.publish(&h);
+        }
+        // What deleting a store leaves: an entry nobody else links to.
+        std::fs::remove_file(a.path(&gone)).unwrap();
+        assert_eq!(sweep_pool(&pool).unwrap(), 1);
+        assert!(pool_entry(&pool, &keep).exists());
+        assert!(!pool_entry(&pool, &gone).exists());
+    }
+
+    #[test]
+    fn without_a_pool_nothing_is_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = ChunkStore::open(tmp.path(), 1 << 20).unwrap();
+        let h = hash(b"x");
+        let _ = s.write_file(&h, b"x").unwrap();
+        s.publish(&h);
+        assert_eq!(s.adopt(&h, b"x"), None);
+        assert_eq!(s.pool(), None);
     }
 }

@@ -115,6 +115,11 @@ typedef struct BfsOptions {
    * Decompressed-chunk cache size; 0 = default.
    */
   uint64_t cache_bytes;
+  /**
+   * Directory for sharing chunk files with other stores, on the same file
+   * system (NUL-terminated); null = don't share.
+   */
+  const char *chunk_pool;
 } BfsOptions;
 
 /**
@@ -228,6 +233,11 @@ typedef struct BfsCompressStats {
   uint64_t stored_bytes;
   uint64_t dedup_chunks;
   uint64_t dedup_bytes;
+  /**
+   * Chunks (and their logical bytes) found in the shared pool.
+   */
+  uint64_t pool_chunks;
+  uint64_t pool_bytes;
 } BfsCompressStats;
 
 /**
@@ -250,6 +260,15 @@ int32_t bfs_set_logger(BfsLogFn f, void *ctx, const char *filter);
  * valid for writes.
  */
 int32_t bfs_open(const char *store_dir, const struct BfsOptions *opts, struct BfsVfs **out);
+
+/**
+ * Removes chunks no store uses from a shared pool, freeing their disk space.
+ * Safe while stores are open; call after deleting a store's directory.
+ *
+ * # Safety
+ * `pool` is a NUL-terminated path.
+ */
+int32_t bfs_sweep_chunk_pool(const char *pool);
 
 /**
  * Stops background work, makes metadata durable and frees the handle.

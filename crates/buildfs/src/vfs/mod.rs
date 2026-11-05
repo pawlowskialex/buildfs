@@ -379,6 +379,9 @@ pub struct Options {
     pub compress_workers: usize,
     /// Decompressed-chunk cache size.
     pub cache_bytes: usize,
+    /// Share chunk files with other stores through this directory (same file
+    /// system as the store; see `chunks`). `None`: keep them to this store.
+    pub chunk_pool: Option<std::path::PathBuf>,
 }
 
 /// Files whose compressed image is at most this big live in redb.
@@ -400,6 +403,7 @@ impl Default for Options {
             compress_workers: std::thread::available_parallelism()
                 .map_or(2, |n| (n.get() / 4).max(1)),
             cache_bytes: 256 << 20,
+            chunk_pool: None,
         }
     }
 }
@@ -433,6 +437,9 @@ pub struct CompressStats {
     /// Chunks (and their logical bytes) that were already stored.
     pub dedup_chunks: u64,
     pub dedup_bytes: u64,
+    /// Chunks (and their logical bytes) found in the shared pool.
+    pub pool_chunks: u64,
+    pub pool_bytes: u64,
 }
 
 pub struct Vfs {
@@ -488,7 +495,10 @@ impl Vfs {
         std::fs::create_dir_all(store)?;
         let db = Database::create(store.join("meta.redb"))?;
         let hot = HotStore::open(store.join("hot"))?;
-        let chunks = ChunkStore::open(store.join("chunks"), options.cache_bytes)?;
+        let mut chunks = ChunkStore::open(store.join("chunks"), options.cache_bytes)?;
+        if let Some(pool) = options.chunk_pool {
+            chunks = chunks.with_pool(pool)?;
+        }
         let wal_dir = store.join("wal");
         let pending = wal::segments(&wal_dir)?;
         let seed = {
@@ -522,11 +532,18 @@ impl Vfs {
         vfs.replay_wal(&pending)?;
         vfs.free_orphans().map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e:?}"))?;
         vfs.gc_data().map_err(|e| anyhow::anyhow!("gc failed: {e:?}"))?;
+        Self::spawn_pool_maintenance(&vfs);
         Self::spawn_flusher(&vfs, options.flush_interval);
         if vfs.compress_after.is_some() {
             Self::spawn_compactor(&vfs, options.compress_workers.max(1));
         }
         Ok(vfs)
+    }
+
+    /// Removes chunks no store uses from a shared pool, freeing their disk
+    /// space. Safe while stores are open; call after deleting a store.
+    pub fn sweep_chunk_pool(pool: &Path) -> anyhow::Result<usize> {
+        Ok(chunks::sweep_pool(pool)?)
     }
 
     /// Stable identity for this store, used as the NFS server owner/scope so
@@ -796,6 +813,37 @@ impl Vfs {
             }
         }
         Ok(())
+    }
+
+    /// Publishes chunks from before this store used the pool (or from a run
+    /// that crashed before publishing) and removes entries nobody uses. Takes
+    /// time proportional to the pool, and nothing depends on it, so it doesn't
+    /// hold up opening the store.
+    fn spawn_pool_maintenance(vfs: &Arc<Self>) {
+        let Some(pool) = vfs.chunks.pool().map(Path::to_path_buf) else { return };
+        let weak = Arc::downgrade(vfs);
+        let spawned = std::thread::Builder::new().name("buildfs-pool".into()).spawn(move || {
+            lower_thread_priority();
+            let files = weak.upgrade().map(|v| v.chunks.list_files());
+            match files {
+                Some(Ok(files)) => {
+                    for h in files {
+                        let Some(vfs) = weak.upgrade() else { return };
+                        vfs.chunks.publish(&h);
+                    }
+                }
+                Some(Err(e)) => warn!("listing chunks for the pool failed: {e}"),
+                None => return,
+            }
+            match chunks::sweep_pool(&pool) {
+                Ok(n) if n > 0 => info!("removed {n} unused chunks from the shared pool"),
+                Ok(_) => {}
+                Err(e) => warn!("sweeping the chunk pool failed: {e}"),
+            }
+        });
+        if let Err(e) = spawned {
+            warn!("failed to start pool maintenance: {e}");
+        }
     }
 
     fn spawn_flusher(vfs: &Arc<Self>, interval: Option<Duration>) {

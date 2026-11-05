@@ -309,3 +309,59 @@ fn bad_handles_are_rejected() {
     assert_eq!(unsafe { bfs_open(ptr::null(), ptr::null(), &mut v) }, libc::EINVAL);
     unsafe { bfs_close(ptr::null_mut()) };
 }
+
+#[test]
+fn stores_share_chunks_through_a_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = CString::new(dir.path().join("pool").to_str().unwrap()).unwrap();
+    let opts = BfsOptions {
+        compress_after_ms: 3_600_000,
+        chunk_pool: pool.as_ptr(),
+        ..Default::default()
+    };
+    let open = |name: &str| {
+        let path = CString::new(dir.path().join(name).to_str().unwrap()).unwrap();
+        let mut v = ptr::null_mut();
+        assert_eq!(unsafe { bfs_open(path.as_ptr(), &opts, &mut v) }, 0);
+        v
+    };
+    let (a, b) = (open("a"), open("b"));
+    let data: Vec<u8> = (0..1_000_000u32).flat_map(|i| (i / 7).to_le_bytes()).collect();
+    let who = me();
+    let put = |v: *mut BfsVfs| {
+        let (mut f, mut d, mut n) = (BfsAttr::default(), BfsAttr::default(), 0usize);
+        let rc = unsafe {
+            bfs_create(v, &who, BFS_ROOT_INO, "f".as_ptr(), 1, BFS_KIND_FILE, 0, 0, ptr::null(), ptr::null(), 0, &mut f, &mut d)
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(unsafe { bfs_write(v, f.ino, 0, data.as_ptr(), data.len(), &mut n, &mut f) }, 0);
+        let mut moved = 0u64;
+        assert_eq!(unsafe { bfs_compact_all(v, &mut moved) }, 0);
+        assert_eq!(moved, 1);
+        f.ino
+    };
+    let (ia, ib) = (put(a), put(b));
+    let mut st = BfsCompressStats::default();
+    assert_eq!(unsafe { bfs_compress_stats(a, &mut st) }, 0);
+    assert_eq!(st.pool_chunks, 0);
+    assert_eq!(unsafe { bfs_compress_stats(b, &mut st) }, 0);
+    assert!(st.pool_chunks > 0, "{st:?}");
+    assert_eq!(st.pool_bytes, data.len() as u64);
+    for (v, ino) in [(a, ia), (b, ib)] {
+        let mut buf = vec![0u8; data.len()];
+        let mut n = 0usize;
+        assert_eq!(unsafe { bfs_read(v, ino, 0, buf.as_mut_ptr(), buf.len(), &mut n) }, 0);
+        assert_eq!((n, &buf), (data.len(), &data));
+    }
+    unsafe { bfs_close(a) };
+    unsafe { bfs_close(b) };
+    // Deleting one store: the sweep has nothing to free, the other reads on.
+    std::fs::remove_dir_all(dir.path().join("a")).unwrap();
+    assert_eq!(unsafe { bfs_sweep_chunk_pool(pool.as_ptr()) }, 0);
+    let b = open("b");
+    let mut buf = vec![0u8; data.len()];
+    let mut n = 0usize;
+    assert_eq!(unsafe { bfs_read(b, ib, 0, buf.as_mut_ptr(), buf.len(), &mut n) }, 0);
+    assert_eq!(buf, data);
+    unsafe { bfs_close(b) };
+}
