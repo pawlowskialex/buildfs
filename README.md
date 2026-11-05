@@ -1,12 +1,23 @@
 # buildfs
 
-A userspace filesystem for build artifacts that compresses everything with
-zstd and stores identical content once. No kernel extension or root needed.
+A userspace filesystem for macOS that compresses build artifacts with zstd and
+stores identical content once: a Rust workspace's `target` directory takes about
+3.5x less space. Tools see an ordinary directory, with hard links, xattrs and
+`mmap` working as usual. No kernel extension or root needed.
+
+**Status: preview.** It passes the test suites below, but hasn't been used on real
+projects for any length of time, so don't keep anything there that you can't
+rebuild. The on-disk format may change. Not tested yet: FSKit across a real reboot,
+logout, sleep and wake, Xcode.app itself, any real system older than macOS 27, and
+real power loss.
 
 ## Quick start
 
+Needs a Rust toolchain (1.88 or later) and macOS. It works right away over NFS; see
+[FSKit](#fskit) for the much faster backend.
+
 ```sh
-cargo build --release          # the CLI: target/release/buildfs
+cargo build --release          # the CLI: put target/release/buildfs on your PATH
 buildfs mount ~/mnt/build      # store "default"; returns once mounted
 CARGO_TARGET_DIR=~/mnt/build/myproject cargo build
 buildfs unmount                # with its attachments
@@ -59,7 +70,10 @@ Things to know about the choice:
 One-time setup: build and register the module, then enable it. This needs
 Xcode, and an Apple developer team of your own in
 `fskit/BuildFS.xcodeproj` (`DEVELOPMENT_TEAM`), because FSKit modules must be
-signed.
+signed. Bundle identifiers belong to one team, so you'll also need to replace
+`com.pawlowskialex.buildfs` there, in `crates/buildfs/src/backend.rs` and in
+`fskit/install.sh`. FSKit's speed depends on `DataCacheHandler`, which is new in
+macOS 27, so earlier versions use NFS.
 
 ```sh
 fskit/install.sh       # builds ~/Applications/BuildFS.app and registers it
@@ -268,10 +282,9 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   Strict mode covers file data and the metadata committed with it. A change with
   no file data (create, rename, chmod, xattrs) waits for the next barrier, which
   is at most about a second away, in both front ends: renaming a file and then
-  losing power can lose the rename. On FSKit, an `fsync` with no dirty data never
-  reaches buildfs, so it can't shorten that wait, including an `fsync` of a
-  directory. Strict mode has been measured but not tested against a real power
-  failure.
+  losing power can lose the rename. On FSKit, `fsync` itself never reaches
+  buildfs, so it can't shorten that wait. Strict mode has been measured but not
+  tested against a real power failure.
 - **Open files.** embednfs reports when open states start and end
   (including lease expiry), and buildfs keeps unlinked inodes alive until
   the last one closes. The server sets `OPEN4_RESULT_PRESERVE_UNLINKED`, so
@@ -289,10 +302,9 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
 - **Speed.** The kernel caches file data (the module grants write-back
   caching), attributes and names, so stat and cached reads don't reach
   buildfs. What's left is about 83 µs per call into the module, nearly all of
-  it in `fskitd` and NSXPC (`docs/HANDOFF-fskit.md` has the profile). A hard
+  it in `fskitd` and NSXPC. A hard
   link takes 12–13 such calls, 9 of them lookups, which is why build tools
-  that hard-link their outputs (cargo) are its slowest case. The raw figures
-  and drafts of the reports for Apple are in `docs/apple-feedback.md`.
+  that hard-link their outputs (cargo) are its slowest case.
 - **Crashes.** If the extension dies, the kernel unmounts the volume within
   about a second. Metadata recovers from the WAL at the next mount. In tests
   every closed file and every fsynced file survived a `kill -9`, even a kill
@@ -339,9 +351,9 @@ it ends.
    `approval_response_wait: sleep interrupted` means that the call was waiting
    for this.
 
-We saw this stall builds for hours under a GUI app, with a prompt on screen.
-Whether that prompt was the whole cause wasn't established: it cleared at about
-the time another app that was issuing many privacy requests (CleanMyMac) exited.
+This has stalled builds for hours under a GUI app, with an allow-or-deny prompt on
+screen. Whether that prompt was the whole cause wasn't established: the stall
+cleared at about the time another app that was making many privacy requests exited.
 
 ## Compression settings
 
@@ -434,3 +446,8 @@ fskit/profile-fskitd.sh           # profile the whole call path (no sudo)
 cargo run --release -p buildfs-core --example vfs_bench
 cargo run --release -p buildfs-core --example compress_eval -- <dirs>
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE). The vendored embednfs crates are also MIT
+([vendor/LICENSE-embednfs](vendor/LICENSE-embednfs)).

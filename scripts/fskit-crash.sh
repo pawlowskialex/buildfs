@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Crash safety of the FSKit volume (docs/HANDOFF-fskit.md §5.4.6): write
+# Crash safety of the FSKit volume: write
 # known files and sync them, start a clean cargo build, kill -9 the
 # extension mid-build, remount, and check that the WAL was replayed, the
 # synced files are intact, and the build can finish.

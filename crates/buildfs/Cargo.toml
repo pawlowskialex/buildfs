@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Transparently compressing NFSv4.1 userspace filesystem for build artifacts"
+description = "Compressing, deduplicating filesystem for build artifacts on macOS"
+repository = "https://github.com/pawlowskialex/buildfs"
 
 [dependencies]
 anyhow = "1"

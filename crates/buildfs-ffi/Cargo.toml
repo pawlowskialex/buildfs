@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "C API over the buildfs core, for the FSKit extension"
+repository = "https://github.com/pawlowskialex/buildfs"
 publish = false
 
 [lib]

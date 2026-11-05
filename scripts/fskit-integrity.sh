@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integrity check of the FSKit volume (docs/HANDOFF-fskit.md §5.4.4):
+# Integrity check of the FSKit volume:
 # clean build of this workspace on a fresh store, hash every file, let the
 # background compactor run, unmount, remount, and compare hashes and
 # metadata. Also builds natively on APFS to compare sizes.

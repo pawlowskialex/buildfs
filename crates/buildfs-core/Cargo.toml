@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "buildfs storage engine: POSIX semantics, compressed chunks, redo log. No front end."
+repository = "https://github.com/pawlowskialex/buildfs"
 publish = false
 
 [dependencies]

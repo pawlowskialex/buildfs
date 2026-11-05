@@ -8,7 +8,7 @@ import os
 // the Rust core (crates/buildfs-ffi, header buildfs_ffi.h).
 //
 // Threading: FSKit delivers every call on one serial queue, and that queue is
-// the per-volume throughput limit (see docs/HANDOFF-fskit.md). Cheap
+// the per-volume throughput limit. Cheap
 // metadata calls run inline on it; calls that can block for long
 // (decompression, rehydration, flush barriers) go to `slowQueue`.
 

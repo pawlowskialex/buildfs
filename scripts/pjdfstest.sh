@@ -4,7 +4,7 @@
 # root-only cases fail on both sides and cancel out.
 #
 # MOUNT_KIND=nfs (default) or fskit (the FSKit module must be installed
-# and enabled; see fskit/try.sh). CLASSIFY=1 also attributes each
+# and enabled; see fskit/install.sh). CLASSIFY=1 also attributes each
 # regression to a cause (scripts/pjdfstest-classify.py).
 #
 # Known buildfs-only failures on FSKit (macOS 27), all FSKit limitations:
