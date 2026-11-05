@@ -298,7 +298,7 @@ fn detach_fskit(a: &Attachment, keep: bool) -> anyhow::Result<()> {
         std::fs::remove_dir(&a.path)?;
         std::fs::rename(&kept, &a.path)?;
     }
-    mounts::discard_fskit_store(&a.export)
+    mounts::delete_store(&a.export)
 }
 
 pub fn print_list(mount: Option<&Path>) -> anyhow::Result<()> {

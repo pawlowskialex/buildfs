@@ -34,7 +34,7 @@ cleanup() {
   "$B" uninstall-agent --name "$NS" > /dev/null 2>&1
   for d in "$T"/*/ "$T"/*/*/; do mounted "${d%/}" && /sbin/umount "${d%/}"; done
   pkill -f -- "--store $NSTORE" 2> /dev/null
-  rm -rf "$T" "$NSTORE"
+  rm -rf "$T" "$NSTORE" "$NSTORE-b" "$NSTORE-p1" "$NSTORE-p2"
 }
 trap cleanup EXIT
 
@@ -154,7 +154,7 @@ check "without flags, a mount stays on its backend" bash -c "'$B' mount --name '
 check "another store on an NFS mountpoint is refused" bash -c "! '$B' mount --backend nfs --name '$NS-b' '$N' 2>/dev/null && [[ ! -e '$NSTORE-b' ]]"
 check "FSKit on an NFS mountpoint is refused" bash -c "! '$B' mount --backend fskit --name '$STORE' '$N' 2>/dev/null"
 check "a second NFS mount gets its own port" bash -c "'$B' mount --backend nfs --name '$NS-b' '$T/nfs2' && [[ \$(from '$T/nfs2') == 127.0.0.1:/ ]] && '$B' unmount --mount '$T/nfs2' > /dev/null && rm -rf '$NSTORE-b'"
-check "delete-store refuses a store in use" bash -c "! '$B' delete-store --backend nfs '$NS' 2>/dev/null && [[ \$(cat '$N/f') == nfs ]]"
+check "delete-store refuses a store in use" bash -c "! '$B' delete-store '$NS' 2>/dev/null && [[ \$(cat '$N/f') == nfs ]]"
 NP="$T/nfsproj"; mkdir -p "$NP/dir"
 check "attach on NFS" bash -c "'$B' attach --mount '$N' '$NP/dir' && echo att > '$NP/dir/a'"
 check "integrate shows the NFS mount" bash -c "'$B' integrate --mount '$N' | grep -q 'buildfs mount: $N'"
@@ -172,7 +172,12 @@ check "macOS 26 uses NFS, and says why" bash -c "BUILDFS_TEST_MACOS_VERSION=26.4
 check "no module uses NFS, and says why" bash -c "BUILDFS_TEST_FSKIT_MODULE=missing '$B' mount --name '$NS' '$N' 2>&1 | grep -q \"module isn't installed\" && [[ \$(from '$N') == 127.0.0.1:/ ]]"
 "$B" unmount --mount "$N" > /dev/null
 check "--backend fskit is honored on macOS 26" bash -c "BUILDFS_TEST_MACOS_VERSION=26.4 '$B' mount --backend fskit --name '$STORE' '$M' && [[ \$(from '$M') == buildfs://$STORE ]] && '$B' unmount --mount '$M' > /dev/null"
-check "FSKit mentions an NFS store it leaves unused" bash -c "'$B' mount --name '$NS' '$T/up' 2>&1 | grep -q 'delete-store --backend nfs' && [[ \$(from '$T/up') == buildfs://$NS ]] && '$B' unmount --mount '$T/up' > /dev/null && '$B' delete-store '$NS' > /dev/null"
+
+# One store, both backends
+check "a store written over NFS opens on FSKit" bash -c "'$B' mount --backend fskit --name '$NS' '$T/up' && [[ \$(from '$T/up') == buildfs://$NS && \$(cat '$T/up/f') == nfs ]]"
+check "the other backend is refused while it's open" bash -c "'$B' mount --backend nfs --name '$NS' '$N' 2>&1 | grep -q 'in use by another mount' && ! /sbin/mount | grep -q ' on $N ('"
+check "and writing on FSKit shows up on NFS" bash -c "echo fskit > '$T/up/g' && xattr -w user.x y '$T/up/g' && '$B' unmount --mount '$T/up' > /dev/null && '$B' mount --backend nfs --name '$NS' '$N' && [[ \$(cat '$N/g') == fskit && \$(xattr -p user.x '$N/g') == y ]] && '$B' unmount --mount '$N' > /dev/null"
+check "du can see the store" bash -c "[[ \$(/usr/bin/du -sk '$NSTORE' | cut -f1) -gt 0 ]]"
 
 # The existing NFS form: foreground, explicit store
 "$B" mount --store "$NSTORE" --port 20555 "$N" > "$T/fg.log" 2>&1 &
@@ -205,8 +210,19 @@ check "and on the attachment" bash -c "[[ \$(cat '$NP/dir/a') == att ]]"
 check "unmount points at uninstall-agent for an NFS agent" bash -c "'$B' unmount --mount '$NA' 2>&1 | grep -q 'uninstall-agent' && [[ \$(from '$NA') == 127.0.0.1:/ ]]"
 check "uninstall the NFS agent" bash -c "'$B' uninstall-agent --name '$NS' && ! /sbin/mount | grep -qE ' on ($NA|$NP/dir) \\('"
 wait_for 10 bash -c "! nfs_server" > /dev/null
-check "delete-store --backend nfs" bash -c "'$B' delete-store --backend nfs '$NS' && [[ ! -e '$NSTORE' ]]"
-check "delete-store of no NFS store fails" bash -c "! '$B' delete-store --backend nfs '$NS' 2>/dev/null"
+check "delete-store" bash -c "'$B' delete-store '$NS' && [[ ! -e '$NSTORE' ]]"
+check "delete-store of no store fails" bash -c "! '$B' delete-store '$NS' 2>/dev/null"
+
+# NFS stores share the chunk pool too
+P1="$HOME/.buildfs/stores/$NS-p1"; P2="$HOME/.buildfs/stores/$NS-p2"
+"$B" mount --backend nfs --name "$NS-p1" --compress-after 1 "$T/p1" > /dev/null 2>&1
+"$B" mount --backend nfs --name "$NS-p2" --compress-after 1 "$T/p2" > /dev/null 2>&1
+cp "$T/payload" "$T/p1/data"; cp "$T/payload" "$T/p2/data"
+python3 -I -c 'import time; time.sleep(8)'
+"$B" unmount --mount "$T/p1" > /dev/null; "$B" unmount --mount "$T/p2" > /dev/null
+if grep -qE '[1-9][0-9]* chunks came from the shared pool' "$HOME/Library/Logs/buildfs-$NS-p1.log" "$HOME/Library/Logs/buildfs-$NS-p2.log"; then ok "NFS stores share chunks"; else bad "NFS stores share chunks"; fi
+check "their data reads back" bash -c "'$B' mount --backend nfs --name '$NS-p1' '$T/p1' > /dev/null && cmp '$T/payload' '$T/p1/data' && '$B' unmount --mount '$T/p1' > /dev/null"
+check "deleting one leaves the other intact" bash -c "'$B' delete-store '$NS-p1' && '$B' mount --backend nfs --name '$NS-p2' '$T/p2' > /dev/null && cmp '$T/payload' '$T/p2/data' && '$B' unmount --mount '$T/p2' > /dev/null && '$B' delete-store '$NS-p2'"
 
 # --sync strict on FSKit
 since=$(date "+%Y-%m-%d %H:%M:%S")
@@ -220,6 +236,6 @@ if /usr/bin/log show --start "$since" --predicate "subsystem == \"com.pawlowskia
 "$B" delete-store "$STORE" > /dev/null
 "$B" delete-store "$AS" > /dev/null
 "$B" delete-store "$(python3 -I -c "import json,os; print(json.load(open(os.path.expanduser('~/Library/Application Support/buildfs/$AS-attachments.json')))[0]['export'])")" > /dev/null
-rm -f "$HOME/Library/Logs/buildfs-$NS.log" "$HOME/Library/Logs/buildfs-$NS-b.log" "$HOME/Library/Logs/buildfs-$AU.log" "$HOME/Library/Logs/buildfs-$AS.log" "$HOME/Library/Application Support/buildfs/$STORE-attachments.json" "$HOME/Library/Application Support/buildfs/$AS-attachments.json"
+rm -f "$HOME/Library/Logs/buildfs-$NS.log" "$HOME/Library/Logs/buildfs-$NS-b.log" "$HOME/Library/Logs/buildfs-$NS-p1.log" "$HOME/Library/Logs/buildfs-$NS-p2.log" "$HOME/Library/Logs/buildfs-$AU.log" "$HOME/Library/Logs/buildfs-$AS.log" "$HOME/Library/Application Support/buildfs/$STORE-attachments.json" "$HOME/Library/Application Support/buildfs/$AS-attachments.json"
 echo "failures: $fails"
 exit $((fails > 0))

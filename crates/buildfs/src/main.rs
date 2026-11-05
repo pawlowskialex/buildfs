@@ -110,9 +110,9 @@ enum Cmd {
     /// With --store or --foreground the NFS server stays in the foreground,
     /// and unmounts on Ctrl-C / SIGTERM.
     Mount {
-        /// Directory holding metadata and data, for NFS (must not be inside
-        /// the mount). Default: ~/.buildfs/stores/<name>. FSKit stores live in
-        /// the module's container.
+        /// Directory holding metadata and data, for NFS only (must not be
+        /// inside the mount). Default: ~/.buildfs/stores/<name>, which both
+        /// backends can use.
         #[arg(long, conflicts_with = "fskit")]
         store: Option<PathBuf>,
         #[command(flatten)]
@@ -128,8 +128,8 @@ enum Cmd {
         /// The same as --backend fskit.
         #[arg(long, conflicts_with = "backend")]
         fskit: bool,
-        /// Use this backend, rather than the one that suits this Mac. Each
-        /// backend has its own stores.
+        /// Use this backend, rather than the one that suits this Mac. Stores
+        /// in the default place work with either.
         #[arg(long, value_enum)]
         backend: Option<BackendKind>,
         /// Store name.
@@ -183,15 +183,10 @@ enum Cmd {
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// Delete a store and everything in it. FSKit stores live in the module's
-    /// sandbox container, which nothing else can touch.
+    /// Delete a store in ~/.buildfs/stores and everything in it.
     DeleteStore {
         /// Store name (the --name it was mounted with).
         name: String,
-        /// The backend whose store to delete (default: the one that `mount`
-        /// would use on this Mac).
-        #[arg(long, value_enum)]
-        backend: Option<BackendKind>,
     },
     /// Point toolchains' artifact/cache locations at the mount (rust, xcode,
     /// go, uv, or `all`). Without tools: show status and what would change.
@@ -289,9 +284,6 @@ async fn main() -> anyhow::Result<()> {
                     if foreground {
                         bail!("--foreground is for NFS: with FSKit there is no server to run");
                     }
-                    if requested.is_none() {
-                        note_unused_nfs_store(&name);
-                    }
                     mount_fskit(&name, &tuning, &mountpoint, options.as_deref())?;
                 }
                 BackendKind::Nfs if store.is_some() || foreground || keep_mounted => {
@@ -351,34 +343,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::UninstallAgent { name } => agent::uninstall(&name)?,
         Cmd::Unmount { mount } => unmount_root(mount.as_deref())?,
-        Cmd::DeleteStore { name, backend } => {
+        Cmd::DeleteStore { name } => {
             mounts::validate_store_name(&name)?;
-            let kind = backend.unwrap_or_else(|| backend::choose(backend::Host::detect()).0);
-            match kind {
-                BackendKind::Fskit => {
-                    let url = mounts::fskit_url(&name);
-                    if let Some((on, _)) = mounts::all_mounts().into_iter().find(|(_, from)| *from == url) {
-                        bail!("{url} is mounted at {}; unmount it first", on.display());
-                    }
-                    if agent::fskit_agent_installed(&name) {
-                        bail!("an agent mounts {url}; run uninstall-agent --name {name} first");
-                    }
-                    mounts::discard_fskit_store(&name)?;
-                    if backend.is_none() {
-                        note_unused_nfs_store(&name);
-                    }
-                }
-                BackendKind::Nfs => {
-                    let store = backend::default_store(&name)?;
-                    if !store.exists() {
-                        bail!("there is no NFS store called {name} ({})", store.display());
-                    }
-                    if backend::store_in_use(&store) {
-                        bail!("{} is in use; unmount it first", store.display());
-                    }
-                    std::fs::remove_dir_all(&store).context("delete store")?;
-                }
+            let store = backend::default_store(&name)?;
+            if !store.exists() {
+                bail!("there is no store called {name} ({})", store.display());
             }
+            if agent::agent_uses_store(&name) {
+                bail!("an agent mounts {name}; run uninstall-agent first");
+            }
+            mounts::delete_store(&name)?;
             println!("deleted store {name}");
         }
         Cmd::Integrate {
@@ -412,20 +386,6 @@ fn choose_for_mount(
         Some(from) if mounts::is_nfs_root(from) => (BackendKind::Nfs, None),
         _ => backend::choose(backend::Host::detect()),
     })
-}
-
-/// FSKit was chosen for `name`, but an NFS store has the same name: say that
-/// it isn't what's in use (which happens on upgrading to macOS 27).
-fn note_unused_nfs_store(name: &str) {
-    if let Ok(store) = backend::default_store(name)
-        && store.exists()
-    {
-        eprintln!(
-            "note: using FSKit, whose stores are separate. The NFS store {} isn't used: \
-             reach it with --backend nfs, or remove it with delete-store --backend nfs {name}",
-            store.display()
-        );
-    }
 }
 
 /// Fails if the module can't mount, rather than installing an agent that can
@@ -462,7 +422,12 @@ fn mount_nfs_detached(
         bail!("store must not live inside the mountpoint");
     }
     let port = match mounted_from(&mountpoint) {
-        None => port.map_or_else(backend::first_free_port, Ok)?,
+        None => {
+            if !backend::wait_until_free(&store) {
+                bail!("store {} is in use by another mount", store.display());
+            }
+            port.map_or_else(backend::first_free_port, Ok)?
+        }
         Some(from) if mounts::is_nfs_root(&from) => {
             let existing = nfs_mount_port(&mountpoint).context("could not determine the server port")?;
             if !backend::port_free(existing) {
@@ -541,6 +506,10 @@ fn mount_fskit(name: &str, tuning: &Tuning, mountpoint: &Path, extra: Option<&st
         Some(from) if mounts::fskit_store(&from) == Some(name) => {}
         Some(from) => bail!("{} is already a mount point ({from})", mountpoint.display()),
         None => {
+            let store = backend::default_store(name)?;
+            if !backend::wait_until_free(&store) {
+                bail!("store {} is in use by another mount", store.display());
+            }
             std::fs::create_dir_all(&mountpoint).context("create mountpoint")?;
             mounts::mount_fskit(name, &mountpoint, &options)?;
             info!("mounted {} at {}", mounts::fskit_url(name), mountpoint.display());
@@ -656,7 +625,14 @@ async fn serve_and_mount(run: NfsRun<'_>, ready_file: Option<&Path>) -> anyhow::
     if !adopt && !mountpoint.exists() {
         std::fs::create_dir_all(&mountpoint).context("create mountpoint")?;
     }
-    let vfs = Vfs::open_with(&store, args.options())?;
+    if !backend::wait_until_free(&store) {
+        bail!("store {} is in use by another mount", store.display());
+    }
+    let vfs_options = Options {
+        chunk_pool: backend::chunk_pool_for(&store),
+        ..args.options()
+    };
+    let vfs = Vfs::open_with(&store, vfs_options)?;
     let server = NfsServer::builder(BuildFs::new(vfs.clone()))
         .server_identity(Vfs::server_identity(&store)?)
         .mandatory_io_locks(false)
@@ -771,6 +747,9 @@ fn log_stats(vfs: &Vfs) {
             st.dedup_bytes as f64 / 1048576.0,
             st.rehydrated
         );
+    }
+    if st.pool_chunks > 0 {
+        info!("{} chunks came from the shared pool", st.pool_chunks);
     }
     if let Ok((bytes, n)) = vfs.chunk_usage() {
         info!("chunk store: {n} distinct chunks, {:.1} MiB", bytes as f64 / 1048576.0);

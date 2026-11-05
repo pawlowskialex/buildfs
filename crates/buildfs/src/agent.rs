@@ -250,6 +250,26 @@ fn stop_agent(name: &str) {
         .status();
 }
 
+/// Whether an agent is installed that mounts the store called `name`.
+pub fn agent_uses_store(name: &str) -> bool {
+    let Ok(store) = crate::backend::default_store(name) else {
+        return false;
+    };
+    let args = |p: PathBuf| std::fs::read_to_string(p).ok().and_then(|t| plist_args(&t)).unwrap_or_default();
+    let same_name_fskit = plist_path(name).map(args).is_ok_and(|a| a.iter().any(|x| x == "--fskit"));
+    let Ok(dir) = home().map(|h| h.join("Library/LaunchAgents")) else {
+        return same_name_fskit;
+    };
+    let store = store.display().to_string();
+    same_name_fskit
+        || std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|e| {
+                e.file_name().to_str().is_some_and(|n| n.starts_with("dev.buildfs."))
+                    && args(e.path()).contains(&store)
+            })
+        })
+}
+
 /// The name of the agent that serves `mountpoint`, if any.
 pub fn agent_for_mountpoint(mountpoint: &Path) -> Option<String> {
     std::fs::read_dir(home().ok()?.join("Library/LaunchAgents"))

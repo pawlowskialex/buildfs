@@ -210,8 +210,6 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
     private var groupCache: [UInt32: [UInt32]] = [:]
     /// `-o trace`: log every lookup and xattr read with its result.
     private var trace = false
-    /// `-o discard`: delete the store when the volume closes (`buildfs detach`).
-    private var discardOnClose = false
     private let slowQueue = DispatchQueue(label: "buildfs.slow", qos: .userInitiated, attributes: .concurrent)
 
     init(storeName: String) {
@@ -219,10 +217,16 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
         super.init(volumeID: FSVolume.Identifier(uuid: volumeUUID(storeName)), volumeName: FSFileName(string: storeName))
     }
 
-    private var storesRoot: String { (NSHomeDirectory() as NSString).appendingPathComponent("stores") }
+    /// `~/.buildfs`, which the extension's entitlements let it use. Inside the
+    /// sandbox `NSHomeDirectory()` is the container, so ask for the real home.
+    private var buildfsDir: String {
+        let home = getpwuid(getuid()).flatMap { $0.pointee.pw_dir }.map { String(cString: $0) } ?? NSHomeDirectory()
+        return (home as NSString).appendingPathComponent(".buildfs")
+    }
+    private var storesRoot: String { (buildfsDir as NSString).appendingPathComponent("stores") }
     private var storeDir: String { (storesRoot as NSString).appendingPathComponent(storeName) }
-    /// Chunk files shared by every store (all stores share this container).
-    private var chunkPool: String { (NSHomeDirectory() as NSString).appendingPathComponent("chunk-pool") }
+    /// Chunk files shared by every store in `~/.buildfs/stores`.
+    private var chunkPool: String { (buildfsDir as NSString).appendingPathComponent("chunk-pool") }
 
     /// Closes the store (idempotent), logging what it holds.
     func close() {
@@ -237,11 +241,6 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             this session compacted \(st.compacted) files (\(st.logical_bytes) -> \(st.stored_bytes) bytes, \
             \(st.dedup_chunks) chunks deduplicated, \(st.pool_chunks) from the shared pool)
             """)
-        if discardOnClose {
-            try? FileManager.default.removeItem(atPath: storeDir)
-            _ = chunkPool.withCString { bfs_sweep_chunk_pool($0) }
-            log.notice("discarded store \(self.storeName, privacy: .public)")
-        }
     }
 
     /// Allocated bytes under `dirs` (what `du` reports), counting hard links
@@ -401,7 +400,6 @@ final class BuildFSVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler
             try? FileManager.default.removeItem(atPath: dir)
             log.notice("fresh: removed store \(dir, privacy: .public)")
         }
-        discardOnClose = mountOpts.contains("discard")
         trace = mountOpts.contains("trace")
         // Tuning from `buildfs mount --fskit --level ...`.
         func value(_ key: String) -> Int? {

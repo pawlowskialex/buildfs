@@ -1,10 +1,14 @@
-//! Which front end a mount uses, and where NFS keeps what FSKit doesn't need.
+//! Which front end a mount uses, and where stores live.
+//!
+//! Both front ends keep stores in `~/.buildfs/stores/<name>`, in the same
+//! format, so a store can move between them. Only one process can have a store
+//! open at a time.
 //!
 //! macOS 27 and later with the module installed use FSKit; anything else uses
 //! NFS. Being installed is all that is tested here: `pluginkit` reports a
 //! disabled module as elected, so only trying the mount can tell. A disabled
 //! module is an error (see `mounts::mount_fskit`), never a reason to use NFS:
-//! that would put data in a different store with no warning.
+//! that would change how the store is served, and its speed, with no warning.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -88,7 +92,7 @@ pub fn choose(host: Host) -> (BackendKind, Option<String>) {
 pub fn requested(fskit: bool, backend: Option<BackendKind>, store: Option<&Path>) -> anyhow::Result<Option<BackendKind>> {
     Ok(match (fskit, backend, store) {
         (_, Some(BackendKind::Fskit), Some(_)) => {
-            bail!("--store is for NFS: FSKit stores live in the module's container, and --name picks one")
+            bail!("--store is for NFS: the FSKit module can only reach ~/.buildfs/stores, and --name picks a store there")
         }
         (true, ..) | (_, Some(BackendKind::Fskit), _) => Some(BackendKind::Fskit),
         (_, Some(BackendKind::Nfs), _) | (_, None, Some(_)) => Some(BackendKind::Nfs),
@@ -96,13 +100,38 @@ pub fn requested(fskit: bool, backend: Option<BackendKind>, store: Option<&Path>
     })
 }
 
-/// Where the NFS store called `name` lives when `--store` doesn't say.
+/// `~/.buildfs`. The FSKit module's entitlements name this folder.
+fn buildfs_dir() -> anyhow::Result<PathBuf> {
+    Ok(std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")?.join(".buildfs"))
+}
+
+/// Where the store called `name` lives, unless `--store` says otherwise.
 pub fn default_store(name: &str) -> anyhow::Result<PathBuf> {
-    Ok(std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")?
-        .join(".buildfs/stores")
-        .join(name))
+    Ok(buildfs_dir()?.join("stores").join(name))
+}
+
+/// Where stores share chunk files. It has to be on the stores' file system,
+/// so only stores in the default place use it.
+pub fn chunk_pool() -> anyhow::Result<PathBuf> {
+    Ok(buildfs_dir()?.join("chunk-pool"))
+}
+
+/// The chunk pool for `store` (a canonical path), if it's in the default place.
+pub fn chunk_pool_for(store: &Path) -> Option<PathBuf> {
+    let stores = std::fs::canonicalize(buildfs_dir().ok()?.join("stores")).ok()?;
+    (store.parent() == Some(stores.as_path())).then(|| chunk_pool().ok()).flatten()
+}
+
+/// Waits a few seconds for `store` to be closed, since a module or server that
+/// just lost its mount takes a moment to. Returns whether it was.
+pub fn wait_until_free(store: &Path) -> bool {
+    for _ in 0..100 {
+        if !store_in_use(store) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 /// Whether nothing listens on `port` on localhost.

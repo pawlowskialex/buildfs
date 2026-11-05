@@ -104,15 +104,22 @@ pub fn mount_fskit(store: &str, dir: &Path, extra: &[String]) -> anyhow::Result<
     )
 }
 
-/// Deletes an FSKit store. Its directory is in the extension's sandbox
-/// container, which only the extension can touch, so this mounts the store
-/// emptied, with the option that deletes it on close.
-pub fn discard_fskit_store(store: &str) -> anyhow::Result<()> {
-    let dir = std::env::temp_dir().join(format!("buildfs-discard-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    let r = mount_fskit(store, &dir, &["fresh".into(), "discard".into()]).and_then(|()| unmount(&dir));
-    let _ = std::fs::remove_dir(&dir);
-    r
+/// Deletes the store called `name`, if it exists, and the chunks that only it
+/// was using. Refuses if the store is open.
+pub fn delete_store(name: &str) -> anyhow::Result<()> {
+    let store = crate::backend::default_store(name)?;
+    if !store.exists() {
+        return Ok(());
+    }
+    if !crate::backend::wait_until_free(&store) {
+        bail!("{} is in use; unmount it first", store.display());
+    }
+    std::fs::remove_dir_all(&store).with_context(|| format!("deleting {}", store.display()))?;
+    let pool = crate::backend::chunk_pool()?;
+    if pool.exists() {
+        buildfs_core::vfs::Vfs::sweep_chunk_pool(&pool).context("sweeping the chunk pool")?;
+    }
+    Ok(())
 }
 
 /// Unmounts `dir`, forcing only if it stays busy for a while: something often
