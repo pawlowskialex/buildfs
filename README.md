@@ -106,6 +106,63 @@ anywhere you like. Those stores can't join the chunk pool, which has to be on th
 same file system as the stores. `serve` runs only the server (mount it yourself
 with `mount_nfs -o vers=4.1,tcp,port=20490,namedattr 127.0.0.1:/ <dir>`).
 
+## Nix
+
+The flake provides the CLI (`packages.aarch64-darwin.default`) and modules for
+[nix-darwin](https://github.com/nix-darwin/nix-darwin)
+(`darwinModules.default`) and
+[home-manager](https://github.com/nix-community/home-manager)
+(`homeModules.default`). They take the same options, so use whichever manages your
+setup, but not both for the same store:
+
+```nix
+{
+  inputs.buildfs.url = "github:pawlowskialex/buildfs";
+
+  # Add buildfs.darwinModules.default or buildfs.homeModules.default to your modules, then:
+  services.buildfs = {
+    enable = true;
+    mounts.default = {
+      mountPoint = "/Users/me/mnt/build";
+      backend = "fskit"; # or "nfs"
+    };
+    integrate.tools = [ "rust" "xcode" "go" "uv" ];
+  };
+}
+```
+
+Each key under `mounts` is a store name, kept running by a launchd agent. Also
+available per mount: `port` (each NFS mount needs its own), `sync`, `level`,
+`compressAfter` and `workers`.
+
+`integrate` is the declarative version of `buildfs integrate`, and also takes `zig`,
+`gradle` and `python`. Use `integrate.mount` if you have several mounts. Xcode is set
+through its defaults, and the rest through environment variables, which override the
+tools' config files, so your `~/.cargo/config.toml` and the like stay yours. Shells get
+them from your configuration, and GUI apps through `launchctl setenv`, once restarted.
+`buildfs integrate` shows these as `integrated through $VARIABLE`, and leaves them
+alone.
+
+- **`backend` is required.** The choice has to stay fixed once the agent is installed,
+  and a Nix build can't tell whether the FSKit module is present.
+- **The FSKit module isn't included**, because it has to be signed with your own
+  developer team. Install it as described under [FSKit](#fskit).
+- **To stop a mount**, remove it from `mounts`; `uninstall-agent` refuses agents managed
+  this way. Unmount an NFS mount first: removing it stops its server, and the mount left
+  behind hangs anything that touches it until `umount -f`.
+- **To stop integrating a tool**, remove it from `integrate.tools`. New shells stop
+  seeing the variable, but GUI apps keep it until you log out or run
+  `launchctl unsetenv`.
+- **With nix-darwin**, agents are installed for every user who logs in but use one
+  user's home, so that module suits a single-user Mac. The home-manager module doesn't
+  have this limit.
+
+Both modules build against current nix-darwin and home-manager, and home-manager's
+agents and variables have been run for real: mounts on both backends, and a cargo build
+landing on the mount. Neither module has been through a real `darwin-rebuild switch` or
+`home-manager switch`, so the agents' restart and removal, the `launchctl setenv` agent
+and the Xcode setting haven't been seen in action.
+
 ## Options
 
 | Option | Default | |
@@ -133,6 +190,9 @@ yourself.
 
 These go through each tool's own configuration, so IDEs (rust-analyzer,
 Xcode, gopls) and scripts pick them up too.
+
+With Nix, use the [`integrate` option](#nix) instead: this command won't write to a
+config file that Nix manages.
 
 **Per-project directories.** `node_modules`, `.next`, SwiftPM `.build`,
 Gradle/CMake `build/` and `.venv` have no global setting. Symlinks aren't

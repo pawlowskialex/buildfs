@@ -1,3 +1,4 @@
 /target
 *.redb
 /.store*
+/result
