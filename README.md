@@ -2,18 +2,59 @@
 
 A userspace filesystem for build artifacts that compresses everything with
 zstd and stores identical content once. No kernel extension or root needed.
-There are two front ends over the same core:
+
+## Quick start
+
+```sh
+cargo build --release          # the CLI: target/release/buildfs
+buildfs mount ~/mnt/build      # store "default"; returns once mounted
+CARGO_TARGET_DIR=~/mnt/build/myproject cargo build
+buildfs unmount                # with its attachments
+```
+
+To keep it mounted across logins and bring it back after a crash:
+
+```sh
+buildfs install-agent ~/mnt/build  # logs: ~/Library/Logs/buildfs-default.log
+buildfs uninstall-agent            # unmounts and removes the agent
+```
+
+Put all projects' target directories under one mount, so that shared
+dependencies are stored once. `--name <store>` selects another store. Stores
+live in `~/.buildfs/stores/<name>`, where `du` works on them;
+`buildfs delete-store <name>` deletes one, freeing what no other store shares.
+
+## Backends
+
+The same commands and the same stores work on two front ends. `buildfs mount`
+uses FSKit on macOS 27 and later if its module is installed, and NFS otherwise,
+saying so when it falls back. `--backend fskit|nfs` overrides that.
 
 | | **FSKit** (macOS 27+) | **NFSv4.1 on localhost** |
 |---|---|---|
-| Incremental cargo build (APFS: 0.9 s) | **2.0 s** | 6.4 s |
+| Incremental cargo build (APFS: 0.9 s) | **2.2 s** | 7.0 s |
 | Setup | build and enable an app extension | none |
-| Server process | none (`fskitd` runs the module) | yes |
+| Server process | none (`fskitd` runs the module) | yes, in the background |
 | FIFOs, sockets, device nodes | no | yes |
 | `--sync strict`, clean build | 2.5x slower | 1.4x slower |
 | Attachments share dedup with the root | large chunks only (shared pool) | yes |
 
-## Quick start: FSKit
+Things to know about the choice:
+
+- **A module that's installed but disabled is an error**, with instructions, not
+  a reason to use NFS: you would silently lose most of the speed. Use
+  `--backend nfs` if that's what you want.
+- **An agent keeps the backend it was installed with**, so upgrading macOS
+  doesn't change what it does. To move an agent to FSKit after upgrading, install
+  it again; the store comes along.
+- **A store can move between backends, but its attachments can't**, because they
+  work differently on each (see below). `detach` them first, and attach them
+  again afterwards.
+- A store can only be open once, so mounting it twice is refused.
+- The check for macOS versions before 27 is unit-tested and simulated
+  (`BUILDFS_TEST_MACOS_VERSION`), but hasn't run on a real older system.
+
+### FSKit
 
 One-time setup: build and register the module, then enable it. This needs
 Xcode, and an Apple developer team of your own in
@@ -21,31 +62,15 @@ Xcode, and an Apple developer team of your own in
 signed.
 
 ```sh
-cargo build --release  # the CLI: target/release/buildfs
 fskit/install.sh       # builds ~/Applications/BuildFS.app and registers it
 # System Settings > General > Login Items & Extensions >
 #   File System Extensions: enable "buildfs"
 ```
 
-Then, with `buildfs` on your `PATH`:
-
-```sh
-buildfs mount --fskit ~/mnt/build          # store "default"; returns at once
-CARGO_TARGET_DIR=~/mnt/build/myproject cargo build
-buildfs unmount                            # with its attachments
-```
-
-To keep it mounted across logins and bring it back after a crash:
-
-```sh
-buildfs install-agent --fskit ~/mnt/build  # logs: ~/Library/Logs/buildfs-default.log
-buildfs uninstall-agent                    # unmounts and removes the agent
-```
-
-`--name <store>` selects another store. Stores live in the module's sandbox
-container, which nothing else can read: `buildfs delete-store <name>` deletes
-one (freeing what no other store shares), and its size and the total for all
-stores are logged whenever it closes
+The module reaches `~/.buildfs` through a sandbox temporary-exception
+entitlement. That may rule out the Mac App Store, and notarizing with it hasn't
+been tried. Stores on other paths can't be used with FSKit. A store's size, and
+the total for all stores, are also logged when it closes
 (`log show --predicate 'subsystem == "com.pawlowskialex.buildfs.fsmodule"' | grep "closed store"`).
 
 Mount with `mount -F -t buildfs -o owners,nobrowse buildfs://<store> <dir>` if
@@ -54,27 +79,18 @@ ignoring ownership, and `chown`/`chgrp` report success but change nothing.
 
 See [FSKit notes](#fskit-notes) for its limits.
 
-## Quick start: NFS
+### NFS
 
-```sh
-cargo build --release
-mkdir -p ~/mnt/build
-./target/release/buildfs mount --store ~/.buildfs-store ~/mnt/build
-CARGO_TARGET_DIR=~/mnt/build/myproject cargo build
-```
+Nothing to set up. `buildfs mount` runs the server in the background (log:
+`~/Library/Logs/buildfs-<store>.log`) on the first free port from 20490. The
+server exits when its mount goes away, so `buildfs unmount` or plain `umount`
+stops it.
 
-`mount` serves and mounts in one process and unmounts on Ctrl-C/SIGTERM.
-Put all projects' target directories under one mount so shared dependencies
-are stored once. `serve` runs only the server (mount it yourself with
-`mount_nfs -o vers=4.1,tcp,port=20490,namedattr 127.0.0.1:/ <dir>`).
-
-To keep a mount running across logins (restarted automatically if it
-crashes; logs in `~/Library/Logs/buildfs-<name>.log`):
-
-```sh
-buildfs install-agent --store ~/.buildfs-store ~/mnt/build
-buildfs uninstall-agent          # unmounts and removes the agent
-```
+For debugging, `--foreground` keeps the server attached to the terminal, where it
+unmounts on Ctrl-C or SIGTERM. So does `--store <dir>`, which keeps a store
+anywhere you like. Those stores can't join the chunk pool, which has to be on the
+same file system as the stores. `serve` runs only the server (mount it yourself
+with `mount_nfs -o vers=4.1,tcp,port=20490,namedattr 127.0.0.1:/ <dir>`).
 
 ## Options
 
@@ -115,9 +131,9 @@ and restored when buildfs mounts; `buildfs attachments` lists them, and
 On NFS an attachment is a subtree of the store. FSKit can't mount a subtree
 (each volume is a process with exclusive access to its store), so there each
 attachment is a store of its own, with its own extension process (about 11 MB
-when idle). All FSKit stores share their compressed chunks through a pool (see
-Design), which pays off when projects have the same dependencies. For
-`node_modules`:
+when idle). All stores in `~/.buildfs/stores` share their compressed chunks
+through a pool (see Design), which pays off when projects have the same
+dependencies. For `node_modules` on FSKit:
 
 | | separate | shared pool |
 |---|---|---|
@@ -136,28 +152,28 @@ ends differ: `npm install` took 8.5 s on an FSKit attachment and 22 s over NFS
 ## Results
 
 Debug builds of the `buildfs` crate, M1 Max, macOS 27.2, interleaved on fresh
-stores (`scripts/bench/compare.sh`, medians of 3 rounds, load average 2–12):
+stores (`scripts/bench/compare.sh`, medians of 3 rounds, load average 2–6):
 
 | | APFS | FSKit | NFS |
 |---|---|---|---|
-| clean build | 10.7 s | 12.2 s | 21.2 s |
-| incremental (leaf crate) | 0.9 s | 2.0 s | 6.4 s |
-| no-op | 0.1 s | 0.3 s | 1.3 s |
-| stat | 2.9 µs | 3.0 µs | 68 µs |
-| create + write 4K + close | 77 µs | 1,062 µs | 13,896 µs |
-| open + read + close | 21 µs | 159 µs | 451 µs |
-| rename | 57 µs | 801 µs | 5,412 µs |
-| hard link | 397 µs | 1,923 µs | 5,366 µs |
-| unlink | 42 µs | 407 µs | 437 µs |
+| clean build | 9.9 s | 11.1 s | 20.5 s |
+| incremental (the storage engine, then the CLI) | 0.9 s | 2.2 s | 7.0 s |
+| no-op | 0.1 s | 0.3 s | 1.4 s |
+| stat | 2.8 µs | 3.1 µs | 67 µs |
+| create + write 4K + close | 77 µs | 1,031 µs | 14,427 µs |
+| open + read + close | 24 µs | 154 µs | 437 µs |
+| rename | 59 µs | 820 µs | 5,710 µs |
+| hard link | 378 µs | 1,707 µs | 5,689 µs |
+| unlink | 42 µs | 405 µs | 439 µs |
 
 Space (the core is the same on both front ends):
 
 | | APFS | buildfs |
 |---|---|---|
-| this workspace, one target dir | 931 MB | **259 MB** (3.60x, FSKit) |
+| this workspace, one target dir | 881 MB | **249 MB** (3.53x, FSKit) |
 | two target dirs, same deps | 1.1 GB | **184 MB** (6.1x: 3.06x zstd, 2x dedup; NFS, older build) |
 
-All 2964 artifacts of the workspace build were byte- and metadata-identical
+All 3082 artifacts of the workspace build were byte- and metadata-identical
 after compression and remount on FSKit
 (`scripts/fskit-integrity.sh`), as were all 4680 of the two-target run on NFS.
 Timings vary ±20% with machine load.
@@ -221,7 +237,7 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   and deleted after its last reference is dropped. Deletion re-checks the
   count under a lock that compaction also holds while committing, so a
   delete racing a new reference can only make that compaction retry.
-- **Shared pool (FSKit).** Stores can't share a database, but they can share
+- **Shared pool.** Stores can't share a database, but they can share
   files. A store publishes each chunk file as a hard link in a pool; another
   store needing that chunk verifies the pool's copy against the bytes it has,
   and links it into its own `chunks/` instead of compressing it. The file's
@@ -285,14 +301,15 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   mounts it again, so a tool that keeps writing by path silently writes to
   your local disk. A process being started from the volume at that moment
   can hang until it is killed (seen once; Ctrl-C clears it).
-- **Privacy permissions.** macOS treats these volumes as network volumes. A
-  terminal needs that permission to use one, and a GUI app started from Finder
-  blocked on it in our test, presumably at a prompt, so expect one from Xcode
-  or your editor. Jobs started by launchd, with no UI to ask, get `EPERM` on the
-  volume: they can mount it but neither read nor unmount it. That's why the
-  agent only ever mounts, and `uninstall-agent` unmounts from your shell. CI
-  runners or other daemons started by launchd probably can't use the mount
-  without being granted that permission (not tested).
+- **Privacy permissions** (NFS mounts too). macOS treats these volumes as
+  network volumes, and each app that uses one needs that permission. A terminal
+  needs it, and so will Xcode or your editor. See
+  [If a volume seems to hang](#if-a-volume-seems-to-hang). Jobs started by launchd
+  can mount a volume, but reading or unmounting it fails with `EPERM` or blocks
+  forever at a prompt no job can answer. That's why neither kind of agent reads
+  its volume, and `uninstall-agent` unmounts from your shell. CI runners or other
+  daemons started by launchd probably can't use the mount without being granted
+  that permission (not tested).
 - **No FIFOs, sockets or device nodes.** FSKit refuses them before the module
   is called: `mkfifo` and `bind` fail with `ENOTSUP`.
 - **Fixed behaviour.** `noatime` is always on. `_PC_PATH_MAX` and
@@ -303,6 +320,28 @@ kernel ── fskitd ── NSXPC ── BuildFSExtension.swift ── crates/bu
   See Durability.
 - **Not tested yet:** the agent across a real reboot or logout, sleep and
   wake, and Xcode.app itself (only `xcodebuild`).
+
+## If a volume seems to hang
+
+Usually it's waiting for a privacy decision, not a problem with buildfs, on
+either backend. The signs: `open`, `mkdir`, `link` and `ls` block indefinitely,
+while `stat` stays instant and the buildfs server or module is idle, because the
+call never reaches it. A blocked call also wedges `umount`, even `umount -f`, until
+it ends.
+
+1. **Look for a prompt on your screen**, possibly behind other windows, and answer
+   it.
+2. Run the same `ls` from Terminal. If that's instant, the permission of the app
+   that started the blocked process is what's in question, and it's often an IDE or
+   other GUI app, not the terminal you think of.
+3. To confirm, kill a blocked command, then run
+   `log show --last 2m --predicate 'process == "kernel" AND eventMessage CONTAINS "approval"'`.
+   `approval_response_wait: sleep interrupted` means that the call was waiting
+   for this.
+
+We saw this stall builds for hours under a GUI app, with a prompt on screen.
+Whether that prompt was the whole cause wasn't established: it cleared at about
+the time another app that was issuing many privacy requests (CleanMyMac) exited.
 
 ## Compression settings
 
@@ -354,15 +393,19 @@ upstream. The ones that matter most:
   other xattr.
 - Hiding `._` files from READDIR breaks xattrs with `rdirplus`, because the
   client answers lookups from cached listings.
-- After a server restart, the request in flight during reconnect can fail
-  with EIO. This happens inside the client's session recovery ("freeing free
-  slot", SEQ_MISORDERED); later requests and data are fine.
+- After a server restart, the request that triggers the client's session
+  recovery fails with EIO, though the server answers everything ("freeing free
+  slot", SEQ_MISORDERED). buildfs triggers recovery itself with `statfs` on each
+  mount before serving users, so this normally isn't seen; a request already in
+  flight can still get it. Later requests and data are fine.
 - Read delegations don't help: the client returns them almost immediately
   (about one DELEGRETURN per OPEN), which adds round trips. Most remaining
   RPCs are lookups of path components in busy directories, which only
   directory delegations could avoid.
 - Unmounting from a process started by launchd hangs in the kernel or fails
-  with EPERM. This is why the agent leaves its mount in place and
+  with EPERM, and so does reading the volume (see
+  [If a volume seems to hang](#if-a-volume-seems-to-hang)). This is why the agent
+  leaves its mount in place, reads its registry from the store, and
   `uninstall-agent` unmounts from your shell.
 
 ## Roadmap
@@ -381,7 +424,7 @@ cargo test --workspace            # embednfs protocol suite, VFS and C API tests
 scripts/pjdfstest.sh              # POSIX suite, diffed against APFS (~8 min)
 MOUNT_KIND=fskit CLASSIFY=1 scripts/pjdfstest.sh   # the same on FSKit (~4 min)
 fskit/install.sh                  # build and register the module
-scripts/fskit-cli.sh              # CLI, attachments and agent, end to end
+scripts/fskit-cli.sh              # CLI, both backends, attachments and agents, end to end
 scripts/fskit-smoke.sh <mount>    # functional checks (FSKIT=1 on FSKit)
 scripts/fskit-integrity.sh        # build, compress, remount, compare
 scripts/fskit-crash.sh            # kill -9 mid-build, recover
