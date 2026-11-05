@@ -48,7 +48,7 @@ run() {
   local T="$d/target" s
   s=$(now); CARGO_TARGET_DIR="$T" cargo build -q -p buildfs --manifest-path "$ROOT/Cargo.toml"; echo "cargo clean: $(since "$s") s"
   for i in 1 2 3; do
-    touch "$ROOT/crates/buildfs/src/vfs/mod.rs"
+    touch "$ROOT/crates/buildfs-core/src/vfs/mod.rs"
     s=$(now); CARGO_TARGET_DIR="$T" cargo build -q -p buildfs --manifest-path "$ROOT/Cargo.toml"; echo "cargo incremental: $(since "$s") s"
   done
   s=$(now); CARGO_TARGET_DIR="$T" cargo build -q -p buildfs --manifest-path "$ROOT/Cargo.toml"; echo "cargo noop: $(since "$s") s"

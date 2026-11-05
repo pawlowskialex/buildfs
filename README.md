@@ -374,6 +374,6 @@ scripts/fskit-crash.sh            # kill -9 mid-build, recover
 scripts/bench/compare.sh          # APFS vs FSKit vs NFS, interleaved
 scripts/bench/calls_per_op.py <mount>   # module calls per syscall
 fskit/profile-fskitd.sh           # profile the whole call path (no sudo)
-cargo run --release -p buildfs --example vfs_bench
-cargo run --release -p buildfs --example compress_eval -- <dirs>
+cargo run --release -p buildfs-core --example vfs_bench
+cargo run --release -p buildfs-core --example compress_eval -- <dirs>
 ```

@@ -9,14 +9,87 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
     AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
-    FileSystem, FsCapabilities, FsError, FsLimits, FsResult, FsStats, HardLinks, ObjectType,
-    OpenTracking,
-    ReadResult, RequestContext, SetAttrs, StableHandles, Symlinks, Timestamp, WriteResult,
-    WriteStability, XattrSetMode, Xattrs,
+    AuthContext, FileSystem, FsCapabilities, FsError, FsLimits, FsResult, FsStats, HardLinks,
+    ObjectType, OpenTracking, ReadResult, RequestContext, SetAttrs, SetTime, StableHandles,
+    Symlinks, Timestamp, WriteResult, WriteStability, XattrSetMode, Xattrs,
 };
 
-use crate::meta::{FLAG_ARCHIVE, FLAG_HIDDEN, FLAG_SYSTEM, Ino, Inode, Kind, ROOT_INO, Ts};
-use crate::vfs::{Caller, MAX_FILE_SIZE, NewNode, SyncMode, Vfs};
+use buildfs_core::meta::{FLAG_ARCHIVE, FLAG_HIDDEN, FLAG_SYSTEM, Ino, Inode, Kind, ROOT_INO, Ts};
+use buildfs_core::vfs::{self, Caller, MAX_FILE_SIZE, NewNode, SyncMode, Vfs};
+
+// ---------------------------------------------------------------------------
+// Conversions between embednfs's types and the core's
+// ---------------------------------------------------------------------------
+
+fn fs_error(e: buildfs_core::FsError) -> FsError {
+    use buildfs_core::FsError as E;
+    match e {
+        E::PermissionDenied => FsError::PermissionDenied,
+        E::NotFound => FsError::NotFound,
+        E::Io => FsError::Io,
+        E::AlreadyExists => FsError::AlreadyExists,
+        E::NotDirectory => FsError::NotDirectory,
+        E::IsDirectory => FsError::IsDirectory,
+        E::InvalidInput => FsError::InvalidInput,
+        E::FileTooLarge => FsError::FileTooLarge,
+        E::NoSpace => FsError::NoSpace,
+        E::NameTooLong => FsError::NameTooLong,
+        E::NotEmpty => FsError::NotEmpty,
+        E::Stale => FsError::Stale,
+    }
+}
+
+fn set_time(t: SetTime) -> buildfs_core::SetTime {
+    match t {
+        SetTime::ServerNow => buildfs_core::SetTime::ServerNow,
+        SetTime::Client(t) => buildfs_core::SetTime::Client(buildfs_core::Timestamp {
+            seconds: t.seconds,
+            nanos: t.nanos,
+        }),
+    }
+}
+
+fn set_attrs(a: &SetAttrs) -> buildfs_core::SetAttrs {
+    buildfs_core::SetAttrs {
+        size: a.size,
+        archive: a.archive,
+        hidden: a.hidden,
+        mode: a.mode,
+        uid: a.uid,
+        gid: a.gid,
+        system: a.system,
+        atime: a.atime.map(set_time),
+        mtime: a.mtime.map(set_time),
+        birthtime: a.birthtime.map(set_time),
+    }
+}
+
+fn xattr_mode(m: XattrSetMode) -> buildfs_core::XattrSetMode {
+    match m {
+        XattrSetMode::CreateOrReplace => buildfs_core::XattrSetMode::CreateOrReplace,
+        XattrSetMode::CreateOnly => buildfs_core::XattrSetMode::CreateOnly,
+        XattrSetMode::ReplaceOnly => buildfs_core::XattrSetMode::ReplaceOnly,
+    }
+}
+
+fn caller(ctx: &RequestContext) -> Caller {
+    match &ctx.auth {
+        AuthContext::Sys {
+            uid,
+            gid,
+            supplemental_gids,
+        } => Caller {
+            uid: *uid,
+            gid: *gid,
+            groups: supplemental_gids.clone(),
+        },
+        _ => Caller {
+            uid: Caller::NOBODY,
+            gid: Caller::NOBODY,
+            groups: Vec::new(),
+        },
+    }
+}
 
 #[derive(Clone)]
 pub struct BuildFs {
@@ -31,12 +104,13 @@ impl BuildFs {
     async fn run<T, F>(&self, f: F) -> FsResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Vfs) -> FsResult<T> + Send + 'static,
+        F: FnOnce(&Vfs) -> vfs::Result<T> + Send + 'static,
     {
         let vfs = self.vfs.clone();
         tokio::task::spawn_blocking(move || f(&vfs))
             .await
             .map_err(|_| FsError::ServerFault)?
+            .map_err(fs_error)
     }
 
     /// Runs a cheap read-only operation directly on the async worker.
@@ -44,8 +118,8 @@ impl BuildFs {
     /// redb reads are MVCC snapshots that never wait for writers and the
     /// hot data is page-cached, so these finish in microseconds; skipping
     /// the blocking-pool handoff roughly halves metadata round-trip latency.
-    fn inline<T>(&self, f: impl FnOnce(&Vfs) -> FsResult<T>) -> FsResult<T> {
-        f(&self.vfs)
+    fn inline<T>(&self, f: impl FnOnce(&Vfs) -> vfs::Result<T>) -> FsResult<T> {
+        f(&self.vfs).map_err(fs_error)
     }
 
     fn attrs(vfs: &Vfs, ino: Ino, inode: &Inode) -> Attrs {
@@ -140,7 +214,7 @@ impl FileSystem for BuildFs {
         h: &Ino,
         requested: AccessMask,
     ) -> FsResult<AccessMask> {
-        let caller = Caller::from_ctx(ctx);
+        let caller = caller(ctx);
         self.inline(|vfs| vfs.access(&caller, *h, requested.bits()).map(AccessMask))
     }
 
@@ -231,7 +305,7 @@ impl FileSystem for BuildFs {
         name: &str,
         req: CreateRequest,
     ) -> FsResult<CreateResult<Ino>> {
-        let (parent, name, caller) = (*parent, name.to_owned(), Caller::from_ctx(ctx));
+        let (parent, name, caller, attrs) = (*parent, name.to_owned(), caller(ctx), set_attrs(&req.attrs));
         self.run(move |vfs| {
             let node = match req.kind {
                 CreateKind::File => NewNode::File,
@@ -241,7 +315,7 @@ impl FileSystem for BuildFs {
                 CreateKind::CharDevice { major, minor } => NewNode::CharDev(major, minor),
                 CreateKind::BlockDevice { major, minor } => NewNode::BlockDev(major, minor),
             };
-            let r = vfs.create(&caller, parent, &name, node, &req.attrs);
+            let r = vfs.create(&caller, parent, &name, node, &attrs);
             tracing::debug!(target: "buildfs::ops", "create {parent}/{name} -> {:?}", r.as_ref().map(|x| x.0));
             let (ino, inode) = r?;
             Ok(CreateResult {
@@ -285,7 +359,7 @@ impl FileSystem for BuildFs {
     }
 
     async fn setattr(&self, ctx: &RequestContext, h: &Ino, attrs: &SetAttrs) -> FsResult<Attrs> {
-        let (ino, attrs, caller) = (*h, attrs.clone(), Caller::from_ctx(ctx));
+        let (ino, attrs, caller) = (*h, set_attrs(attrs), caller(ctx));
         self.run(move |vfs| {
             let inode = vfs.setattr(&caller, ino, &attrs)?;
             Ok(Self::attrs(vfs, ino, &inode))
@@ -360,7 +434,7 @@ impl Xattrs<Ino> for BuildFs {
         mode: XattrSetMode,
     ) -> FsResult<()> {
         let (ino, name) = (*h, name.to_owned());
-        self.run(move |vfs| vfs.set_xattr(ino, &name, &value, mode))
+        self.run(move |vfs| vfs.set_xattr(ino, &name, &value, xattr_mode(mode)))
             .await
     }
 
@@ -388,8 +462,8 @@ impl Symlinks<Ino> for BuildFs {
             *parent,
             name.to_owned(),
             target.to_owned(),
-            attrs.clone(),
-            Caller::from_ctx(ctx),
+            set_attrs(attrs),
+            caller(ctx),
         );
         self.run(move |vfs| {
             let (ino, inode) =

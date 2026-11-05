@@ -1,6 +1,6 @@
-use buildfs::meta::{Kind, ROOT_INO};
-use buildfs::vfs::{Caller, NewNode, Options, Vfs};
-use embednfs::{FsError, SetAttrs, XattrSetMode};
+use buildfs_core::meta::{Kind, ROOT_INO};
+use buildfs_core::vfs::{Caller, NewNode, Options, Vfs};
+use buildfs_core::{FsError, SetAttrs, XattrSetMode};
 
 fn user() -> Caller {
     Caller {
@@ -268,7 +268,7 @@ fn permissions() {
         gid: 777,
         groups: vec![],
     };
-    use buildfs::vfs::access::*;
+    use buildfs_core::vfs::access::*;
     assert_eq!(vfs.access(&other, f, READ | MODIFY).unwrap(), READ);
     assert_eq!(vfs.access(&user(), f, READ | MODIFY).unwrap(), READ | MODIFY);
     assert_eq!(
@@ -438,7 +438,7 @@ fn read_all(vfs: &Vfs, ino: u64) -> Vec<u8> {
 
 #[test]
 fn compacts_large_file_to_chunks_and_reads_randomly() {
-    use buildfs::meta::Data;
+    use buildfs_core::meta::Data;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
     let f = mkfile(&vfs, ROOT_INO, "libbig.rlib");
@@ -474,7 +474,7 @@ fn compacts_large_file_to_chunks_and_reads_randomly() {
 
 #[test]
 fn tiny_files_go_inline_and_empty_files_drop_data() {
-    use buildfs::meta::Data;
+    use buildfs_core::meta::Data;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
     let d = mkfile(&vfs, ROOT_INO, "foo.d");
@@ -495,7 +495,7 @@ fn tiny_files_go_inline_and_empty_files_drop_data() {
 
 #[test]
 fn writes_rehydrate_and_truncate_drops_chunks() {
-    use buildfs::meta::Data;
+    use buildfs_core::meta::Data;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = Vfs::open_with(tmp.path(), manual_compaction()).unwrap();
     let f = mkfile(&vfs, ROOT_INO, "out");
@@ -620,7 +620,7 @@ fn concurrent_writes_never_lose_data_to_compaction() {
 
 #[test]
 fn background_compactor_runs_after_idle_delay() {
-    use buildfs::meta::Data;
+    use buildfs_core::meta::Data;
     let tmp = tempfile::tempdir().unwrap();
     let opts = Options {
         compress_after: Some(std::time::Duration::from_millis(200)),

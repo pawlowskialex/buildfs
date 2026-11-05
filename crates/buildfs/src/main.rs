@@ -16,7 +16,7 @@ use mounts::{Backend, Root, mounted_from, nfs_mount_port, resolve_mountpoint};
 
 use buildfs::ids::SystemIdMapper;
 use buildfs::nfs::BuildFs;
-use buildfs::vfs::{Options, SyncMode, Vfs};
+use buildfs_core::vfs::{Options, SyncMode, Vfs};
 
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum Sync {
@@ -211,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "info,embednfs=warn".into()),
         )
         .init();
-    match buildfs::raise_fd_limit() {
+    match buildfs_core::raise_fd_limit() {
         Ok(n) => tracing::debug!("open file limit: {n}"),
         Err(e) => tracing::warn!("could not raise the open file limit: {e}"),
     }

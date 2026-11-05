@@ -164,22 +164,36 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "buildfs-core",
  "bytes",
  "clap",
- "crc32fast",
  "embednfs",
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml_edit 0.23.10+spec-1.0.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "buildfs-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "crc32fast",
  "libc",
  "parking_lot",
  "postcard",
  "redb",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
- "tokio",
- "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
- "tracing-subscriber",
  "zstd",
 ]
 
@@ -187,9 +201,8 @@ dependencies = [
 name = "buildfs-ffi"
 version = "0.1.0"
 dependencies = [
- "buildfs",
+ "buildfs-core",
  "cbindgen",
- "embednfs",
  "libc",
  "tempfile",
  "tracing",

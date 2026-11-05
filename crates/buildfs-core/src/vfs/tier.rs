@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use embednfs::FsError;
+use crate::types::FsError;
 use parking_lot::Mutex;
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::{debug, error};

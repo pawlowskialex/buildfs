@@ -1,0 +1,24 @@
+[package]
+name = "buildfs-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "buildfs storage engine: POSIX semantics, compressed chunks, redo log. No front end."
+publish = false
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+crc32fast = "1"
+libc = "0.2"
+parking_lot = "0.12"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+redb = "4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+zstd = "0.14"
+
+[dev-dependencies]
+tempfile = "3"

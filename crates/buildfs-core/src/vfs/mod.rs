@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use embednfs::{AuthContext, FsError, RequestContext, SetAttrs, SetTime, XattrSetMode};
 use parking_lot::{Condvar, Mutex};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table};
 use tracing::{error, info, warn};
 
 use crate::chunks::{self, ChunkStore, Hash};
+use crate::types::{FsError, SetAttrs, SetTime, XattrSetMode};
 use crate::hot::HotStore;
 use crate::meta::*;
 use crate::wal::{self, Mutation, Wal};
@@ -90,25 +90,6 @@ pub struct Caller {
 
 impl Caller {
     pub const NOBODY: u32 = 65534;
-
-    pub fn from_ctx(ctx: &RequestContext) -> Self {
-        match &ctx.auth {
-            AuthContext::Sys {
-                uid,
-                gid,
-                supplemental_gids,
-            } => Self {
-                uid: *uid,
-                gid: *gid,
-                groups: supplemental_gids.clone(),
-            },
-            _ => Self {
-                uid: Self::NOBODY,
-                gid: Self::NOBODY,
-                groups: Vec::new(),
-            },
-        }
-    }
 
     pub fn root() -> Self {
         Self {

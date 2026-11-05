@@ -29,7 +29,7 @@ if [[ "${CARGO_BENCH:-1}" == 1 ]]; then
   CARGO_TARGET_DIR="$T" cargo build -q -p buildfs --manifest-path ../Cargo.toml
   echo "clean: $(( $(date +%s) - s ))s"
   for i in 1 2 3; do
-    touch ../crates/buildfs/src/vfs/mod.rs
+    touch ../crates/buildfs-core/src/vfs/mod.rs
     s=$(python3 -c 'import time; print(time.time())')
     CARGO_TARGET_DIR="$T" cargo build -q -p buildfs --manifest-path ../Cargo.toml
     python3 -c "import time; print('incremental #$i: %.2fs' % (time.time() - $s))"

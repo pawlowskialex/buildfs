@@ -1,9 +1,9 @@
 //! Measures VFS core latency without NFS in the way.
 use std::time::Instant;
 
-use buildfs::meta::ROOT_INO;
-use buildfs::vfs::{Caller, NewNode, Vfs};
-use embednfs::SetAttrs;
+use buildfs_core::SetAttrs;
+use buildfs_core::meta::ROOT_INO;
+use buildfs_core::vfs::{Caller, NewNode, Vfs};
 
 fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "/tmp/bfs-vfs-bench".into());

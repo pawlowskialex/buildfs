@@ -1,4 +1,4 @@
-//! C API over [`buildfs::vfs::Vfs`], linked into the FSKit extension.
+//! C API over [`buildfs_core::vfs::Vfs`], linked into the FSKit extension.
 //!
 //! Conventions:
 //! - Every fallible function returns 0 or a positive errno.
@@ -18,9 +18,9 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use buildfs::meta::{FLAG_ARCHIVE, FLAG_HIDDEN, Ino, Inode, Kind};
-use buildfs::vfs::{Caller, NewNode, Options, Vfs};
-use embednfs::{FsError, SetAttrs, SetTime, Timestamp, XattrSetMode};
+use buildfs_core::meta::{FLAG_ARCHIVE, FLAG_HIDDEN, Ino, Inode, Kind};
+use buildfs_core::vfs::{Caller, NewNode, Options, Vfs};
+use buildfs_core::{FsError, SetAttrs, SetTime, Timestamp, XattrSetMode};
 
 /// An open store. Opaque to C.
 pub struct BfsVfs {
@@ -44,11 +44,11 @@ pub const BFS_KIND_SOCKET: u32 = 7;
 pub const BFS_MAX_XATTR_SIZE: u64 = 64 << 20;
 /// Largest file size.
 pub const BFS_MAX_FILE_SIZE: u64 = 1 << 50;
-const _: () = assert!(BFS_MAX_FILE_SIZE == buildfs::vfs::MAX_FILE_SIZE);
+const _: () = assert!(BFS_MAX_FILE_SIZE == buildfs_core::vfs::MAX_FILE_SIZE);
 
 /// The root directory's inode number.
 pub const BFS_ROOT_INO: u64 = 1;
-const _: () = assert!(BFS_ROOT_INO == buildfs::meta::ROOT_INO);
+const _: () = assert!(BFS_ROOT_INO == buildfs_core::meta::ROOT_INO);
 
 // BSD file flags (`st_flags`) the store can represent.
 pub const BFS_UF_HIDDEN: u32 = 0x0000_8000;
@@ -232,21 +232,16 @@ fn errno(e: FsError) -> i32 {
     match e {
         FsError::PermissionDenied => libc::EPERM,
         FsError::NotFound => libc::ENOENT,
-        FsError::AccessDenied => libc::EACCES,
         FsError::AlreadyExists => libc::EEXIST,
-        FsError::CrossDevice => libc::EXDEV,
         FsError::NotDirectory => libc::ENOTDIR,
         FsError::IsDirectory => libc::EISDIR,
         FsError::InvalidInput => libc::EINVAL,
         FsError::FileTooLarge => libc::EFBIG,
         FsError::NoSpace => libc::ENOSPC,
-        FsError::ReadOnly => libc::EROFS,
         FsError::NameTooLong => libc::ENAMETOOLONG,
         FsError::NotEmpty => libc::ENOTEMPTY,
         FsError::Stale => libc::ESTALE,
-        FsError::Unsupported => libc::ENOTSUP,
-        FsError::BadHandle => libc::EBADF,
-        FsError::Ok | FsError::Io | FsError::ServerFault => libc::EIO,
+        FsError::Io => libc::EIO,
     }
 }
 
@@ -368,7 +363,7 @@ fn kind_code(k: Kind) -> u32 {
     }
 }
 
-fn time(t: buildfs::meta::Ts) -> BfsTime {
+fn time(t: buildfs_core::meta::Ts) -> BfsTime {
     BfsTime {
         sec: t.sec,
         nsec: i64::from(t.nsec),
@@ -607,7 +602,7 @@ pub unsafe extern "C" fn bfs_open(
             let pool = unsafe { CStr::from_ptr(o.chunk_pool) }.to_str().map_err(|_| libc::EILSEQ)?;
             options.chunk_pool = Some(Path::new(pool).to_path_buf());
         }
-        match buildfs::raise_fd_limit() {
+        match buildfs_core::raise_fd_limit() {
             Ok(n) => tracing::info!("open file limit: {n}"),
             Err(e) => tracing::warn!("could not raise the open file limit: {e}"),
         }
