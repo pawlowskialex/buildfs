@@ -37,6 +37,13 @@ pid=$(/usr/bin/log show --last 10m --style ndjson --predicate "subsystem == \"co
 since=$(date "+%Y-%m-%d %H:%M:%S")
 echo "killing extension pid $pid ${KILL_AFTER}s into the build"
 kill -9 "$pid"
+# A process being exec'd from the volume at the moment it dies can hang at
+# _dyld_start until signalled, leaving cargo waiting for it. Seen once.
+for _ in $(seq 1 30); do kill -0 "$build" 2>/dev/null || break; sleep 1; done
+if kill -0 "$build" 2>/dev/null; then
+  echo "note: build still running 30 s after the kill; signalling what it waits for"
+  pkill -TERM -P "$build" 2>/dev/null
+fi
 wait "$build"; echo "build after kill exited $? (expected to fail)"
 
 # The kernel keeps the dead mount; take it down and remount.
