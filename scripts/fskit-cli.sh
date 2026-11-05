@@ -53,6 +53,8 @@ export CARGO_HOME_REAL="${CARGO_HOME:-$HOME/.cargo}"
 check "integrate shows the mount" bash -c "'$B' integrate | grep -q 'buildfs mount: $M'"
 check "integrate rust" bash -c "CARGO_HOME='$T/cargo' '$B' integrate rust && grep -q 'build-dir = \"$M/cargo/' '$T/cargo/config.toml'"
 check "integrate --revert" bash -c "CARGO_HOME='$T/cargo' '$B' integrate rust --revert && ! grep -q build-dir '$T/cargo/config.toml'"
+check "integrate reports a setting made through the environment" bash -c "CARGO_BUILD_BUILD_DIR='$M/cargo/x' CARGO_HOME='$T/cargo' '$B' integrate | grep -q 'integrated through \$CARGO_BUILD_BUILD_DIR'"
+check "and leaves it alone" bash -c "CARGO_BUILD_BUILD_DIR='$M/cargo/x' CARGO_HOME='$T/cargo' '$B' integrate rust | grep -q 'left alone' && ! grep -q build-dir '$T/cargo/config.toml'"
 
 # Attach: empty, then with contents
 P="$T/proj"; mkdir -p "$P/empty" "$P/full/sub"

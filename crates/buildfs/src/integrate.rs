@@ -4,7 +4,9 @@
 //!
 //! Settings are only changed when the user names the tool; existing values
 //! that don't point into the mount are never overwritten, and `--revert`
-//! only removes values that do.
+//! only removes values that do. Settings made through an environment variable
+//! (the Nix modules do that) or a file that Nix manages are reported, and left to
+//! whatever set them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,12 +86,26 @@ impl TomlKey {
                 }
             }
         }
+        if managed_by_nix(&self.file) {
+            bail!(
+                "{} is managed by Nix, so change this in your configuration (or use services.buildfs.integrate)",
+                self.file.display()
+            );
+        }
         if let Some(parent) = self.file.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&self.file, doc.to_string())?;
         Ok(())
     }
+}
+
+/// Whether `file` is a link into the (read-only) Nix store, as home-manager makes.
+/// It may take more than one hop to get there.
+fn managed_by_nix(file: &Path) -> bool {
+    std::fs::canonicalize(file)
+        .or_else(|_| std::fs::read_link(file))
+        .is_ok_and(|target| target.starts_with("/nix/store"))
 }
 
 enum Store {
@@ -160,6 +176,8 @@ struct Integration {
     what: &'static str,
     installed: bool,
     store: Store,
+    /// The environment variable that overrides `store`, if the tool has one.
+    env: Option<&'static str>,
     /// Value relative to the mount root.
     value: &'static str,
     note: Option<&'static str>,
@@ -181,6 +199,7 @@ fn integrations() -> anyhow::Result<Vec<Integration>> {
                 table: Some("build"),
                 key: "build-dir",
             }),
+            env: Some("CARGO_BUILD_BUILD_DIR"),
             value: "cargo/{workspace-path-hash}",
             note: None,
         },
@@ -189,6 +208,7 @@ fn integrations() -> anyhow::Result<Vec<Integration>> {
             what: "Xcode DerivedData (Xcode and xcodebuild)",
             installed: Path::new("/Applications/Xcode.app").exists() || have("xcodebuild"),
             store: Store::Defaults(xcode_domain, "IDECustomDerivedDataLocation"),
+            env: None,
             value: "xcode/DerivedData",
             note: Some("restart Xcode to apply"),
         },
@@ -197,6 +217,7 @@ fn integrations() -> anyhow::Result<Vec<Integration>> {
             what: "Go build cache (GOCACHE)",
             installed: have("go"),
             store: Store::GoEnv("GOCACHE"),
+            env: Some("GOCACHE"),
             value: "go/cache",
             note: None,
         },
@@ -209,6 +230,7 @@ fn integrations() -> anyhow::Result<Vec<Integration>> {
                 table: None,
                 key: "cache-dir",
             }),
+            env: Some("UV_CACHE_DIR"),
             value: "uv/cache",
             note: Some("uv falls back to copying across filesystems; set UV_LINK_MODE=copy to silence the warning"),
         },
@@ -221,6 +243,24 @@ const ENV_ONLY: &[(&str, &str, &str)] = &[
     ("gradle", "GRADLE_USER_HOME", "gradle"),
     ("python bytecode", "PYTHONPYCACHEPREFIX", "pycache"),
 ];
+
+impl Integration {
+    /// The environment variable overriding this setting, and its value.
+    fn overridden(&self) -> Option<(&'static str, String)> {
+        let var = self.env?;
+        Some((var, std::env::var(var).ok().filter(|v| !v.is_empty())?))
+    }
+}
+
+/// What to say about a setting made through `var`, which a tool's config can't
+/// override and this command shouldn't try to.
+fn describe_override(var: &str, value: &str, root: &Path) -> String {
+    if Path::new(value).starts_with(root) {
+        format!("integrated through ${var}")
+    } else {
+        format!("set elsewhere through ${var}: {value}")
+    }
+}
 
 pub fn run(tools: &[String], mount: Option<&Path>, revert: bool) -> anyhow::Result<()> {
     let root = find_root_mount(mount)?.path;
@@ -243,11 +283,12 @@ pub fn run(tools: &[String], mount: Option<&Path>, revert: bool) -> anyhow::Resu
         for i in &all {
             let target = root.join(i.value);
             let current = i.store.get().unwrap_or(None);
-            let state = match &current {
+            let state = match (&current, i.overridden()) {
                 _ if !i.installed => "not installed".to_owned(),
-                Some(v) if Path::new(v).starts_with(&root) => "integrated".to_owned(),
-                Some(v) => format!("set elsewhere: {v}"),
-                None => "not integrated".to_owned(),
+                (_, Some((var, value))) => describe_override(var, &value, &root),
+                (Some(v), None) if Path::new(v).starts_with(&root) => "integrated".to_owned(),
+                (Some(v), None) => format!("set elsewhere: {v}"),
+                (None, None) => "not integrated".to_owned(),
             };
             println!("{:6} {state}\n       {}\n       {} = {}\n", i.name, i.what, i.store.describe(), target.display());
         }
@@ -261,6 +302,10 @@ pub fn run(tools: &[String], mount: Option<&Path>, revert: bool) -> anyhow::Resu
     }
 
     for i in selected {
+        if let Some((var, value)) = i.overridden() {
+            println!("{}: {}; left alone (change it where it's set)", i.name, describe_override(var, &value, &root));
+            continue;
+        }
         let target = root.join(i.value);
         let current = i.store.get()?;
         let ours = current.as_deref().is_some_and(|v| Path::new(v).starts_with(&root));
@@ -293,4 +338,39 @@ pub fn run(tools: &[String], mount: Option<&Path>, revert: bool) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overrides_are_told_apart() {
+        let root = Path::new("/m");
+        assert_eq!(describe_override("GOCACHE", "/m/go/cache", root), "integrated through $GOCACHE");
+        assert_eq!(
+            describe_override("GOCACHE", "/other", root),
+            "set elsewhere through $GOCACHE: /other"
+        );
+        // Cargo expands the template, so it isn't a real path yet.
+        assert!(describe_override("X", "/m/cargo/{workspace-path-hash}", root).starts_with("integrated"));
+    }
+
+    #[test]
+    fn files_in_the_nix_store_are_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("/nix/store/does-not-exist/config.toml", &link).unwrap();
+        assert!(managed_by_nix(&link));
+        let key = TomlKey { file: link, table: Some("build"), key: "build-dir" };
+        let err = key.set(Some("/m/cargo")).unwrap_err().to_string();
+        assert!(err.contains("managed by Nix"), "{err}");
+
+        let plain = dir.path().join("plain.toml");
+        std::fs::write(&plain, "").unwrap();
+        assert!(!managed_by_nix(&plain));
+        let key = TomlKey { file: plain.clone(), table: Some("build"), key: "build-dir" };
+        key.set(Some("/m/cargo")).unwrap();
+        assert!(std::fs::read_to_string(plain).unwrap().contains("build-dir"));
+    }
 }

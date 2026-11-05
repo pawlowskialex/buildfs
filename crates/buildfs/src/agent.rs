@@ -192,6 +192,7 @@ pub fn install(kind: Kind<'_>, args: &Tuning, mountpoint: &Path, name: &str) -> 
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("agent name may only contain letters, digits, '-' and '_'");
     }
+    refuse_managed_agent(name)?;
     let exe = std::env::current_exe()?.canonicalize()?;
     let mountpoint = absolute(mountpoint)?;
     std::fs::create_dir_all(&mountpoint)?;
@@ -250,50 +251,115 @@ fn stop_agent(name: &str) {
         .status();
 }
 
-/// Whether an agent is installed that mounts the store called `name`.
-pub fn agent_uses_store(name: &str) -> bool {
-    let Ok(store) = crate::backend::default_store(name) else {
-        return false;
-    };
-    let args = |p: PathBuf| std::fs::read_to_string(p).ok().and_then(|t| plist_args(&t)).unwrap_or_default();
-    let same_name_fskit = plist_path(name).map(args).is_ok_and(|a| a.iter().any(|x| x == "--fskit"));
-    let Ok(dir) = home().map(|h| h.join("Library/LaunchAgents")) else {
-        return same_name_fskit;
-    };
-    let store = store.display().to_string();
-    same_name_fskit
-        || std::fs::read_dir(dir).is_ok_and(|entries| {
-            entries.filter_map(Result::ok).any(|e| {
-                e.file_name().to_str().is_some_and(|n| n.starts_with("dev.buildfs."))
-                    && args(e.path()).contains(&store)
+/// Where a system-wide manager such as nix-darwin puts agents.
+const SYSTEM_AGENTS: &str = "/Library/LaunchAgents";
+
+/// An installed agent.
+#[derive(Debug)]
+struct Agent {
+    name: String,
+    mountpoint: Option<PathBuf>,
+    store: Option<String>,
+    fskit: bool,
+    /// Installed by a system configuration, not by `install-agent`.
+    managed: bool,
+}
+
+/// The value of an environment variable set in a plist.
+fn plist_env(text: &str, var: &str) -> Option<String> {
+    let after = text.split(&format!("<key>{var}</key>")).nth(1)?;
+    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+    Some(value.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&"))
+}
+
+impl Agent {
+    /// Reads a plist. The Nix modules say what an agent does in its environment,
+    /// because launchd wrappers make the arguments unreadable; `install-agent`
+    /// plists have the mountpoint last, and name the backend and store.
+    fn parse(name: String, text: &str, system: bool) -> Option<Self> {
+        if let Some(mountpoint) = plist_env(text, "BUILDFS_MANAGED_MOUNTPOINT") {
+            return Some(Self {
+                name,
+                mountpoint: Some(mountpoint.into()),
+                store: plist_env(text, "BUILDFS_MANAGED_STORE"),
+                fskit: plist_env(text, "BUILDFS_MANAGED_BACKEND").as_deref() == Some("fskit"),
+                managed: true,
+            });
+        }
+        let args = plist_args(text)?;
+        Some(Self {
+            name,
+            mountpoint: args.last().map(PathBuf::from),
+            store: args.windows(2).find(|w| w[0] == "--store").map(|w| w[1].clone()),
+            fskit: args.iter().any(|a| a == "--fskit"),
+            managed: system,
+        })
+    }
+
+    fn how_to_stop(&self) -> String {
+        if self.managed {
+            "remove it from your system configuration".to_owned()
+        } else {
+            format!("run uninstall-agent --name {}", self.name)
+        }
+    }
+}
+
+/// The buildfs agents in `dirs`; `(directory, whether it's system-wide)`.
+fn agents_in(dirs: &[(PathBuf, bool)]) -> Vec<Agent> {
+    dirs.iter()
+        .filter_map(|(dir, system)| Some((std::fs::read_dir(dir).ok()?, *system)))
+        .flat_map(|(entries, system)| {
+            entries.filter_map(Result::ok).filter_map(move |e| {
+                let file = e.file_name();
+                let name = file.to_str()?.strip_prefix("dev.buildfs.")?.strip_suffix(".plist")?.to_owned();
+                Agent::parse(name, &std::fs::read_to_string(e.path()).ok()?, system)
             })
         })
+        .collect()
 }
 
-/// The name of the agent that serves `mountpoint`, if any.
+fn agents() -> Vec<Agent> {
+    let mut dirs = vec![(PathBuf::from(SYSTEM_AGENTS), true)];
+    if let Ok(home) = home() {
+        dirs.push((home.join("Library/LaunchAgents"), false));
+    }
+    agents_in(&dirs)
+}
+
+/// How to stop the agent that mounts the store called `name`, if there is one.
+pub fn agent_using_store(name: &str) -> Option<String> {
+    let store = crate::backend::default_store(name).ok()?.display().to_string();
+    agents()
+        .into_iter()
+        .find(|a| (a.name == name && a.fskit) || a.store.as_deref() == Some(store.as_str()))
+        .map(|a| a.how_to_stop())
+}
+
+/// How to stop the agent that serves `mountpoint`, if there is one.
 pub fn agent_for_mountpoint(mountpoint: &Path) -> Option<String> {
-    std::fs::read_dir(home().ok()?.join("Library/LaunchAgents"))
-        .ok()?
-        .filter_map(Result::ok)
-        .find_map(|e| {
-            let file = e.file_name();
-            let name = file.to_str()?.strip_prefix("dev.buildfs.")?.strip_suffix(".plist")?.to_owned();
-            let args = plist_args(&std::fs::read_to_string(e.path()).ok()?)?;
-            (args.last().map(Path::new) == Some(mountpoint)).then_some(name)
-        })
+    agents()
+        .into_iter()
+        .find(|a| a.mountpoint.as_deref() == Some(mountpoint))
+        .map(|a| a.how_to_stop())
 }
 
-/// Whether an FSKit agent is installed for store `name` (`buildfs unmount`
-/// warns that it will mount the volume again).
-pub fn fskit_agent_installed(name: &str) -> bool {
-    plist_path(name)
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| plist_args(&t))
-        .is_some_and(|a| a.iter().any(|x| x == "--fskit"))
+/// How to stop the FSKit agent for store `name`, if there is one (`buildfs
+/// unmount` warns that it will mount the volume again).
+pub fn fskit_agent_for_store(name: &str) -> Option<String> {
+    agents().into_iter().find(|a| a.name == name && a.fskit).map(|a| a.how_to_stop())
+}
+
+/// Refuses to touch an agent that a system configuration manages.
+fn refuse_managed_agent(name: &str) -> anyhow::Result<()> {
+    if agents().iter().any(|a| a.name == name && a.managed) {
+        bail!("{} is managed by your system configuration; change it there", label(name));
+    }
+    Ok(())
 }
 
 pub fn uninstall(name: &str) -> anyhow::Result<()> {
+    refuse_managed_agent(name)?;
     let path = plist_path(name)?;
     let args = std::fs::read_to_string(&path).ok().and_then(|t| plist_args(&t)).unwrap_or_default();
     let fskit = args.iter().any(|a| a == "--fskit");
@@ -346,6 +412,40 @@ mod tests {
             compress_after: 15,
             workers: None,
         }
+    }
+
+    #[test]
+    fn agents_are_found_and_understood() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: String| std::fs::write(dir.path().join(format!("dev.buildfs.{name}.plist")), text).unwrap();
+        // As nix-darwin and home-manager generate them: one shell string.
+        let managed = |mountpoint: &str, backend: &str| {
+            format!(
+                "<plist><dict>\n<key>EnvironmentVariables</key>\n<dict>\n\t<key>BUILDFS_MANAGED_BACKEND</key>\n\t<string>{backend}</string>\n\
+                 \t<key>BUILDFS_MANAGED_MOUNTPOINT</key>\n\t<string>{mountpoint}</string>\n\t<key>BUILDFS_MANAGED_STORE</key>\n\t<string>/h/s/x</string>\n</dict>\n\
+                 <key>ProgramArguments</key>\n<array>\n\t<string>/bin/sh</string>\n\t<string>-c</string>\n\t<string>/bin/wait4path /nix/store &amp;&amp; exec /nix/b mount</string>\n</array>\n</dict></plist>\n"
+            )
+        };
+        write("fast", managed("/m/a&amp;b", "fskit"));
+        write("slow", managed("/m/slow", "nfs"));
+        let argv = nfs_argv(Path::new("/b"), Path::new("/s"), 20490, &tuning(), Path::new("/m/own"));
+        write("own", plist_text("own", &argv, &Kind::Nfs { store: Path::new("/s"), port: 20490 }, Path::new("/log")));
+        std::fs::write(dir.path().join("dev.buildfs-setenv.plist"), "<plist/>").unwrap();
+
+        let mut found = agents_in(&[(dir.path().to_path_buf(), false)]);
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<&str> = found.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["fast", "own", "slow"]);
+        let (fast, own, slow) = (&found[0], &found[1], &found[2]);
+        assert!(fast.fskit && fast.managed);
+        assert_eq!(fast.mountpoint.as_deref(), Some(Path::new("/m/a&b")));
+        assert_eq!(fast.store.as_deref(), Some("/h/s/x"));
+        assert!(fast.how_to_stop().contains("system configuration"));
+        assert!(!slow.fskit && slow.managed);
+        assert!(!own.fskit && !own.managed);
+        assert_eq!(own.mountpoint.as_deref(), Some(Path::new("/m/own")));
+        assert_eq!(own.store.as_deref(), Some("/s"));
+        assert!(own.how_to_stop().contains("uninstall-agent --name own"));
     }
 
     #[test]

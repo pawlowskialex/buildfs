@@ -349,8 +349,8 @@ async fn main() -> anyhow::Result<()> {
             if !store.exists() {
                 bail!("there is no store called {name} ({})", store.display());
             }
-            if agent::agent_uses_store(&name) {
-                bail!("an agent mounts {name}; run uninstall-agent first");
+            if let Some(how) = agent::agent_using_store(&name) {
+                bail!("an agent mounts {name}; {how} first");
             }
             mounts::delete_store(&name)?;
             println!("deleted store {name}");
@@ -526,15 +526,15 @@ fn unmount_root(mount: Option<&Path>) -> anyhow::Result<()> {
     let root = mounts::find_root_mount(mount)?;
     match &root.backend {
         Backend::Fskit { store } => {
-            if agent::fskit_agent_installed(store) {
-                warn!("an agent is installed for {store} and will mount it again within 30 s; use uninstall-agent to stop it");
+            if let Some(how) = agent::fskit_agent_for_store(store) {
+                warn!("an agent is installed for {store} and will mount it again within 30 s; to stop it, {how}");
             }
         }
         Backend::Nfs { .. } => {
             // Its server stays up while the mount is gone, and would serve
             // nothing until it was restarted.
-            if let Some(name) = agent::agent_for_mountpoint(&root.path) {
-                bail!("an agent serves {}; use uninstall-agent --name {name}", root.path.display());
+            if let Some(how) = agent::agent_for_mountpoint(&root.path) {
+                bail!("an agent serves {}; to stop it, {how}", root.path.display());
             }
         }
     }
